@@ -69,7 +69,10 @@ import type {
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import * as path from "node:path";
 import { basename, dirname, join, resolve } from "node:path";
+
+import ignore from "ignore";
 
 import {
   SandboxManager,
@@ -179,12 +182,11 @@ function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): Sand
 // ── Domain helpers ────────────────────────────────────────────────────────────
 
 export function shouldPromptForWrite(
-  path: string,
+  filePath: string,
   allowWrite: string[],
-  matchesPattern: (path: string, patterns: string[]) => boolean,
+  cwd: string,
 ): boolean {
-  // Secure default: empty allowWrite means deny-all writes (prompt every path).
-  return allowWrite.length === 0 || !matchesPattern(path, allowWrite);
+  return allowWrite.length === 0 || !matchesPattern(filePath, allowWrite, cwd);
 }
 
 function extractDomainsFromCommand(command: string): string[] {
@@ -231,7 +233,9 @@ function extractBlockedWritePath(output: string): string | null {
 // ── Path pattern matching ─────────────────────────────────────────────────────
 
 function expandPath(filePath: string): string {
-  const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
+  const expanded = filePath
+    .replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? `\${${name}}`)
+    .replace(/^~(?=$|\/)/, homedir());
   return resolve(expanded);
 }
 
@@ -258,17 +262,40 @@ function canonicalizePath(filePath: string): string {
   }
 }
 
-function matchesPattern(filePath: string, patterns: string[]): boolean {
+function matchesPattern(filePath: string, patterns: string[], cwd: string): boolean {
   const abs = canonicalizePath(filePath);
-  return patterns.some((p) => {
-    const absP = p.includes("*") ? expandPath(p) : canonicalizePath(p);
-    if (p.includes("*")) {
-      const escaped = absP.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-      return new RegExp(`^${escaped}$`).test(abs);
+  const relativePatterns: string[] = [];
+  const absolutePatterns: string[] = [];
+  for (const p of patterns) {
+    const expanded = expandPath(p);
+    if (path.isAbsolute(expanded)) {
+      absolutePatterns.push(expanded);
+    } else {
+      relativePatterns.push(p);
     }
-    const sep = absP.endsWith("/") ? "" : "/";
-    return abs === absP || abs.startsWith(absP + sep);
-  });
+  }
+  // Absolute pattern matching with glob support
+  for (const absP of absolutePatterns) {
+    if (absP.includes("*")) {
+      const escaped = absP
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*\*/g, "[^]*")
+        .replace(/\*/g, "[^/]*");
+      if (new RegExp(`^${escaped}$`).test(abs)) return true;
+    } else {
+      const sep = absP.endsWith("/") ? "" : "/";
+      if (abs === absP || abs.startsWith(absP + sep)) return true;
+    }
+  }
+  // Relative pattern matching via ignore (gitignore semantics)
+  if (relativePatterns.length > 0) {
+    const rel = path.relative(cwd, abs);
+    if (!rel.startsWith("..") && !path.isAbsolute(rel)) {
+      const ig = ignore().add(relativePatterns);
+      if (ig.ignores(rel)) return true;
+    }
+  }
+  return false;
 }
 
 // ── Config file updaters (Node.js process — not OS-sandboxed) ─────────────────
@@ -757,7 +784,7 @@ export default function (pi: ExtensionAPI) {
             // Check if denyWrite would still block it even after allowing.
             const config = loadConfig(ctx.cwd);
             const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-            if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [])) {
+            if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [], ctx.cwd)) {
               ctx.ui.notify(
                 `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
                   `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
@@ -850,7 +877,7 @@ export default function (pi: ExtensionAPI) {
       const filePath = canonicalizePath(event.input.path);
       const effectiveAllowRead = getEffectiveAllowRead(ctx.cwd);
 
-      if (!matchesPattern(filePath, effectiveAllowRead)) {
+      if (!matchesPattern(filePath, effectiveAllowRead, ctx.cwd)) {
         const choice = await promptReadBlock(ctx, filePath);
         if (choice === "abort") {
           return {
@@ -871,7 +898,7 @@ export default function (pi: ExtensionAPI) {
       const denyWrite = config.filesystem?.denyWrite ?? [];
 
       // denyWrite takes precedence and is never prompted.
-      if (matchesPattern(path, denyWrite)) {
+      if (matchesPattern(path, denyWrite, ctx.cwd)) {
         return {
           block: true,
           reason:
@@ -880,7 +907,7 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      if (shouldPromptForWrite(path, allowWrite, matchesPattern)) {
+      if (shouldPromptForWrite(path, allowWrite, ctx.cwd)) {
         const choice = await promptWriteBlock(ctx, path);
         if (choice === "abort") {
           return {
