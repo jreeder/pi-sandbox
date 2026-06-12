@@ -197,6 +197,34 @@ export function shouldPromptForWrite(
   return allowWrite.length === 0 || !matchesPattern(filePath, allowWrite, cwd);
 }
 
+/**
+ * Extract candidate file paths from a bash command string for pre-execution
+ * policy checks. Intentionally broad — false positives are acceptable since
+ * they only produce an extra prompt; false negatives mean a sensitive file
+ * slips through to the OS sandbox layer.
+ *
+ * Matches tokens that look like file paths: optional leading ./ ../ ~/ ${ or /,
+ * followed by word characters, dots, hyphens, with at least one dot in the name
+ * (to avoid matching plain command names like `cat` or `grep`).
+ */
+function extractPathsFromCommand(command: string): string[] {
+  // Strip comments and quoted strings to reduce noise, then tokenize.
+  const stripped = command
+    .replace(/#[^\n]*/g, "")             // strip # comments
+    .replace(/'[^']*'/g, " ")            // strip single-quoted strings
+    .replace(/"[^"]*"/g, " ");           // strip double-quoted strings (rough)
+
+  const re =
+    /(?:^|[\s=|(;&`])((~\/|\.{1,2}\/|\$\{?\w+\}?\/|\/[\w])[^\s;|&'"<>]*)/g;
+  const paths = new Set<string>();
+  let m;
+  while ((m = re.exec(stripped)) !== null) {
+    const p = m[1].replace(/[);,]+$/, ""); // trim trailing punctuation
+    if (p) paths.add(p);
+  }
+  return [...paths];
+}
+
 function extractDomainsFromCommand(command: string): string[] {
   const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
   const domains = new Set<string>();
@@ -923,7 +951,7 @@ export default function (pi: ExtensionAPI) {
 
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
-    // Network pre-check for bash tool calls.
+    // Network pre-check and denyRead pre-check for bash tool calls.
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
       const domains = extractDomainsFromCommand(event.input.command);
       const effectiveDomains = getEffectiveAllowedDomains(ctx.cwd);
@@ -937,6 +965,30 @@ export default function (pi: ExtensionAPI) {
             };
           }
           await applyDomainChoice(choice, domain, ctx.cwd);
+        }
+      }
+
+      // denyRead pre-check: catch roundabout reads (e.g. `cat .env`) before
+      // the command runs. Mirrors the read-tool policy: prompt unless the path
+      // is already in effectiveAllowRead; granting adds to allowRead.
+      const denyRead = config.filesystem?.denyRead ?? [];
+      if (denyRead.length > 0) {
+        const effectiveAllowRead = getEffectiveAllowRead(ctx.cwd);
+        const candidatePaths = extractPathsFromCommand(event.input.command);
+        for (const p of candidatePaths) {
+          if (
+            matchesPattern(p, denyRead, ctx.cwd) &&
+            !matchesPattern(p, effectiveAllowRead, ctx.cwd)
+          ) {
+            const choice = await promptReadBlock(ctx, p);
+            if (choice === "abort") {
+              return {
+                block: true,
+                reason: `Sandbox: read access denied for "${p}" (matches denyRead).`,
+              };
+            }
+            await applyReadChoice(choice, p, ctx.cwd);
+          }
         }
       }
     }
