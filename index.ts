@@ -230,12 +230,56 @@ function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback 
 
 // ── Output analysis ───────────────────────────────────────────────────────────
 
-/** Extract a path from a bash "Operation not permitted" OS sandbox error. */
+/**
+ * Patterns that indicate a write was denied by the OS sandbox.
+ * Covers: shell built-in errors, common coreutils (cp, mv, tee, install, rsync),
+ * and generic "permission denied" / "read-only file system" syscall errors.
+ */
+const WRITE_BLOCK_PATTERNS: RegExp[] = [
+  // Shell: bash/sh: [line N:] /path: Operation not permitted
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Oo]peration not permitted/,
+  // Shell: bash/sh: [line N:] /path: Permission denied
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Pp]ermission denied/,
+  // coreutils write errors: cannot create/open/write to '/path'
+  /cannot (?:create|open|write to)(?: regular file)? ['"]?(\/[^\s'"]+)['"]?/,
+  // cp/mv/install: '/src' -> '/dst': Permission denied  (dst is what's blocked)
+  /['"]?(\/[^\s'"]+)['"]? -> ['"]?(\/[^\s'"]+)['"]?: (?:[Pp]ermission denied|[Oo]peration not permitted)/,
+  // tee, redirect: /path: Permission denied
+  /(\/[^\s:]+): [Pp]ermission denied/,
+  // Read-only file system
+  /(\/[^\s:]+): [Rr]ead-only file system/,
+];
+
+/**
+ * Patterns that indicate a read was denied by the OS sandbox.
+ */
+const READ_BLOCK_PATTERNS: RegExp[] = [
+  // Shell: bash/sh: [line N:] /path: Permission denied  (reads surface this way too)
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Pp]ermission denied/,
+  // cat, head, tail, grep, etc: /path: Permission denied
+  /(\/[^\s:]+): [Pp]ermission denied/,
+  // open/cannot open: /path: Permission denied
+  /(?:cannot open|failed to open|error opening) ['"]?(\/[^\s'"]+)['"]?.*[Pp]ermission denied/,
+  // No such file — bubblewrap hides denied paths as ENOENT on some kernels
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): No such file or directory/,
+];
+
+function extractBlockedPath(patterns: RegExp[], output: string): string | null {
+  for (const re of patterns) {
+    const match = output.match(re);
+    if (match) {
+      // Last capture group is the relevant path (dst for src->dst patterns)
+      const captured = match.slice(1).filter(Boolean);
+      const p = captured[captured.length - 1];
+      if (p) return p;
+    }
+  }
+  return null;
+}
+
+/** @deprecated use extractBlockedPath(WRITE_BLOCK_PATTERNS, output) */
 function extractBlockedWritePath(output: string): string | null {
-  const match = output.match(
-    /(?:\/bin\/bash|bash|sh): (?:line \d: )?(\/[^\s:]+): Operation not permitted/,
-  );
-  return match ? match[1] : null;
+  return extractBlockedPath(WRITE_BLOCK_PATTERNS, output);
 }
 
 // ── Path pattern matching ─────────────────────────────────────────────────────
@@ -771,7 +815,10 @@ export default function (pi: ExtensionAPI) {
         result = await runBash();
       } catch (e) {
         if (!(e instanceof Error)) throw e;
-        if (!e.message.includes("Operation not permitted")) throw e;
+        const isSandboxError =
+          e.message.includes("Operation not permitted") ||
+          e.message.includes("Permission denied");
+        if (!isSandboxError) throw e;
 
         result = {
           content: [
@@ -784,25 +831,25 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      // Post-execution: detect OS-level write block and offer to allow.
+      // Post-execution: detect OS-level read/write blocks and offer to allow.
       if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
         const outputText = result.content
           .filter((c: any) => c.type === "text")
           .map((c: any) => c.text)
           .join("\n");
 
-        const blockedPath = extractBlockedWritePath(outputText);
-        if (blockedPath) {
-          const choice = await promptWriteBlock(ctx, blockedPath);
+        // Write block — check denyWrite before prompting.
+        const blockedWritePath = extractBlockedPath(WRITE_BLOCK_PATTERNS, outputText);
+        if (blockedWritePath) {
+          const choice = await promptWriteBlock(ctx, blockedWritePath);
           if (choice !== "abort") {
-            await applyWriteChoice(choice, blockedPath, ctx.cwd);
+            await applyWriteChoice(choice, blockedWritePath, ctx.cwd);
 
-            // Check if denyWrite would still block it even after allowing.
             const config = loadConfig(ctx.cwd);
             const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
-            if (matchesPattern(blockedPath, config.filesystem?.denyWrite ?? [], ctx.cwd)) {
+            if (matchesPattern(blockedWritePath, config.filesystem?.denyWrite ?? [], ctx.cwd)) {
               ctx.ui.notify(
-                `⚠️ "${blockedPath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
+                `⚠️ "${blockedWritePath}" was added to allowWrite, but it is also in denyWrite and will remain blocked.\n` +
                   `Check denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
                 "warning",
               );
@@ -810,15 +857,26 @@ export default function (pi: ExtensionAPI) {
             }
 
             onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `\n--- Write access granted for "${blockedPath}", retrying ---\n`,
-                },
-              ],
+              content: [{ type: "text", text: `\n--- Write access granted for "${blockedWritePath}", retrying ---\n` }],
               details: {},
             });
             return runBash();
+          }
+        }
+
+        // Read block — only surfaces in output when a write block wasn't already found.
+        if (!blockedWritePath) {
+          const blockedReadPath = extractBlockedPath(READ_BLOCK_PATTERNS, outputText);
+          if (blockedReadPath) {
+            const choice = await promptReadBlock(ctx, blockedReadPath);
+            if (choice !== "abort") {
+              await applyReadChoice(choice, blockedReadPath, ctx.cwd);
+              onUpdate?.({
+                content: [{ type: "text", text: `\n--- Read access granted for "${blockedReadPath}", retrying ---\n` }],
+                details: {},
+              });
+              return runBash();
+            }
           }
         }
       }
