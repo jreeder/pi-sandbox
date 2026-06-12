@@ -141,7 +141,15 @@ function loadConfig(cwd: string): SandboxConfig {
     }
   }
 
-  return deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
+  const merged = deepMerge(deepMerge(DEFAULT_CONFIG, globalConfig), projectConfig);
+  if (merged.filesystem) {
+    const fs = merged.filesystem;
+    if (fs.denyRead) fs.denyRead = expandPatternList(fs.denyRead);
+    if (fs.allowRead) fs.allowRead = expandPatternList(fs.allowRead);
+    if (fs.allowWrite) fs.allowWrite = expandPatternList(fs.allowWrite);
+    if (fs.denyWrite) fs.denyWrite = expandPatternList(fs.denyWrite);
+  }
+  return merged;
 }
 
 function deepMerge(base: SandboxConfig, overrides: Partial<SandboxConfig>): SandboxConfig {
@@ -233,10 +241,18 @@ function extractBlockedWritePath(output: string): string | null {
 // ── Path pattern matching ─────────────────────────────────────────────────────
 
 function expandPath(filePath: string): string {
-  const expanded = filePath
+  const expanded = filePath.replace(/^~(?=$|\/)/, homedir());
+  return resolve(expanded);
+}
+
+function expandEnvVars(pattern: string): string {
+  return pattern
     .replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? `\${${name}}`)
     .replace(/^~(?=$|\/)/, homedir());
-  return resolve(expanded);
+}
+
+function expandPatternList(patterns: string[]): string[] {
+  return patterns.map(expandEnvVars);
 }
 
 function canonicalizePath(filePath: string): string {
