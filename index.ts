@@ -968,15 +968,27 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // denyRead pre-check: catch roundabout reads (e.g. `cat .env`) before
-      // the command runs. Mirrors the read-tool policy: prompt unless the path
-      // is already in effectiveAllowRead; granting adds to allowRead.
+      // denyRead / denyWrite pre-check: enforce gitignore-style relative patterns
+      // (e.g. `.env`, `*.pem`) before the command runs. The OS sandbox layer only
+      // sees expanded absolute paths and cannot apply these semantics itself.
       const denyRead = config.filesystem?.denyRead ?? [];
-      if (denyRead.length > 0) {
+      const denyWrite = config.filesystem?.denyWrite ?? [];
+      if (denyRead.length > 0 || denyWrite.length > 0) {
         const effectiveAllowRead = getEffectiveAllowRead(ctx.cwd);
         const candidatePaths = extractPathsFromCommand(event.input.command);
         for (const p of candidatePaths) {
+          // denyWrite is a hard block — no prompt, matches tool_call write behavior.
+          if (denyWrite.length > 0 && matchesPattern(p, denyWrite, ctx.cwd)) {
+            return {
+              block: true,
+              reason:
+                `Sandbox: "${p}" matches denyWrite. ` +
+                `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+            };
+          }
+          // denyRead: prompt unless already in allowRead.
           if (
+            denyRead.length > 0 &&
             matchesPattern(p, denyRead, ctx.cwd) &&
             !matchesPattern(p, effectiveAllowRead, ctx.cwd)
           ) {
