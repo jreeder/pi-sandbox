@@ -1,5 +1,5 @@
 import { mkdtempSync, mkdirSync, symlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -10,7 +10,9 @@ import {
   canonicalizePath,
   decideWritePolicy,
   domainIsAllowed,
+  expandEnvVars,
   extractDomainsFromCommand,
+  extractPathsFromCommand,
   matchesPattern,
   resolveWritePermission,
 } from "../src/policy.ts";
@@ -30,10 +32,10 @@ test("matches exact, wildcard, and all-domain policies", () => {
 });
 
 test("decides write policy from deny and allow lists", () => {
-  assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], ["/tmp/file"]), "deny");
-  assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], []), "allow");
-  assert.equal(decideWritePolicy("/tmp/file", ["/var"], []), "prompt");
-  assert.equal(decideWritePolicy("/tmp/file", [], []), "prompt");
+  assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], ["/tmp/file"], "/tmp"), "deny");
+  assert.equal(decideWritePolicy("/tmp/file", ["/tmp"], [], "/tmp"), "allow");
+  assert.equal(decideWritePolicy("/tmp/file", ["/var"], [], "/tmp"), "prompt");
+  assert.equal(decideWritePolicy("/tmp/file", [], [], "/tmp"), "prompt");
 });
 
 test("resolves write permission without prompting for denied or allowed paths", async () => {
@@ -51,6 +53,7 @@ test("resolves write permission without prompting for denied or allowed paths", 
       path: "/tmp/file",
       allowWrite: ["/tmp"],
       denyWrite: ["/tmp/file"],
+      cwd: "/tmp",
       prompt,
       saveWritePermission: apply,
     }),
@@ -61,6 +64,7 @@ test("resolves write permission without prompting for denied or allowed paths", 
       path: "/tmp/file",
       allowWrite: ["/tmp"],
       denyWrite: [],
+      cwd: "/tmp",
       prompt,
       saveWritePermission: apply,
     }),
@@ -76,6 +80,7 @@ test("resolves write permission prompt choices", async () => {
       path: "/tmp/file",
       allowWrite: [],
       denyWrite: [],
+      cwd: "/tmp",
       prompt: async () => ({ action: "abort", value: "/tmp/file" }),
       saveWritePermission: async (choice, value) => {
         applied.push(`${choice}:${value}`);
@@ -90,6 +95,7 @@ test("resolves write permission prompt choices", async () => {
       path: "/tmp/file",
       allowWrite: [],
       denyWrite: [],
+      cwd: "/tmp",
       prompt: async () => ({ action: "session", value: "/tmp" }),
       saveWritePermission: async (choice, value) => {
         applied.push(`${choice}:${value}`);
@@ -102,9 +108,43 @@ test("resolves write permission prompt choices", async () => {
 
 test("path patterns support directory prefixes and globs", () => {
   const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-policy-")));
-  assert.equal(matchesPattern(join(root, "nested", "file.txt"), [root]), true);
-  assert.equal(matchesPattern(join(root, "file.pem"), [join(root, "*.pem")]), true);
-  assert.equal(matchesPattern(join(root, "file.txt"), [join(root, "*.pem")]), false);
+  assert.equal(matchesPattern(join(root, "nested", "file.txt"), [root], root), true);
+  assert.equal(matchesPattern(join(root, "file.pem"), [join(root, "*.pem")], root), true);
+  assert.equal(matchesPattern(join(root, "file.txt"), [join(root, "*.pem")], root), false);
+});
+
+test("relative patterns are matched with gitignore semantics under cwd", () => {
+  const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-gitignore-")));
+  assert.equal(matchesPattern(join(root, ".env"), [".env"], root), true);
+  assert.equal(matchesPattern(join(root, ".env.local"), [".env.*"], root), true);
+  assert.equal(matchesPattern(join(root, "keep.txt"), [".env"], root), false);
+  assert.equal(matchesPattern(join(root, "nested", "secret.pem"), ["*.pem"], root), true);
+  // Outside cwd, relative patterns never match.
+  assert.equal(matchesPattern("/etc/.env", [".env"], root), false);
+});
+
+test("expandEnvVars expands ${VAR} references and a leading ~", () => {
+  const original = process.env.PI_SANDBOX_TEST_VAR;
+  process.env.PI_SANDBOX_TEST_VAR = "/custom/path";
+  try {
+    assert.equal(expandEnvVars("${PI_SANDBOX_TEST_VAR}/file"), "/custom/path/file");
+    assert.equal(expandEnvVars("${PI_SANDBOX_UNSET_VAR}/file"), "${PI_SANDBOX_UNSET_VAR}/file");
+    assert.equal(expandEnvVars("~"), homedir());
+    assert.equal(expandEnvVars("~/foo"), join(homedir(), "foo"));
+  } finally {
+    if (original === undefined) delete process.env.PI_SANDBOX_TEST_VAR;
+    else process.env.PI_SANDBOX_TEST_VAR = original;
+  }
+});
+
+test("extractPathsFromCommand pulls plausible file paths and ignores quoted strings", () => {
+  // Bare relative names with no ./ ../ ~/ prefix are intentionally not
+  // matched — only tokens that already look like paths are considered.
+  assert.deepEqual(extractPathsFromCommand("cat .env"), []);
+  assert.deepEqual(extractPathsFromCommand("cat ./.env"), ["./.env"]);
+  assert.deepEqual(extractPathsFromCommand("cat ./config/secret.pem"), ["./config/secret.pem"]);
+  assert.deepEqual(extractPathsFromCommand("echo 'not/a/path' && cat ./real.pem"), ["./real.pem"]);
+  assert.deepEqual(extractPathsFromCommand("cat /etc/passwd"), ["/etc/passwd"]);
 });
 
 test("canonicalizes symlinks and nonexistent descendants", () => {

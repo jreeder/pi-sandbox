@@ -98,6 +98,10 @@ Note below that the order of precedence for filesystem read and write are opposi
 }
 ```
 
+Filesystem patterns may reference environment variables with `${VAR}` syntax
+(e.g. `"${HOME}/secrets"`) and a leading `~` is expanded to the home
+directory; both are resolved when the config is loaded.
+
 #### Usage
 
 ```
@@ -143,11 +147,23 @@ extension reloads or pi restarts.
 | Path not in `allowRead` or `allowWrite` | Prompted (read tool); granting adds to `allowRead` |
 | Path not in `allowWrite` | Prompted (write/edit tools and bash write failures) |
 | Path in `denyWrite` | Hard-blocked, no prompt |
+| Path in `denyRead` referenced by a bash command | Prompted before the command runs; granting adds to `allowRead` |
+| Path in `denyWrite` referenced by a bash command | Hard-blocked before the command runs, no prompt |
+| Bash output indicates a read the OS sandbox denied | Prompted after the command runs, same as write blocks |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
 
 If a path is added to `allowWrite` via a prompt but is also present in
 `denyWrite`, it remains blocked. A warning is shown explaining which config
 files to check.
+
+Bash commands are also scanned for candidate file paths (best-effort — only
+tokens that already look like a path, e.g. `./`, `../`, `~/`, `${VAR}/`, or an
+absolute path) before they run, so `denyRead`/`denyWrite` rules apply
+pre-execution instead of only surfacing after the OS sandbox blocks the
+command. `denyRead` and `denyWrite` entries without a leading `/` (e.g.
+`.env`, `*.pem`) are matched using gitignore semantics relative to the
+working directory, the same way they'd behave in a `.gitignore` file.
+Entries starting with `/` are matched as absolute path prefixes or globs.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it

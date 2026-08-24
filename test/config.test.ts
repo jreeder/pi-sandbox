@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,6 +12,7 @@ import {
   DEFAULT_CONFIG,
   DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
   getConfigPaths,
+  loadConfig,
   mergeConfigLayers,
 } from "../src/config.ts";
 
@@ -107,6 +108,32 @@ test("getConfigPaths uses Pi's configured agent directory", () => {
   } finally {
     if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  }
+});
+
+test("loadConfig expands env vars and ~ in filesystem patterns", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-loadconfig-"));
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  writeFileSync(
+    join(cwd, ".pi", "sandbox.json"),
+    JSON.stringify({
+      filesystem: { allowRead: ["${PI_SANDBOX_TEST_ROOT}/data", "~/notes"] },
+    }),
+  );
+
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const originalTestRoot = process.env.PI_SANDBOX_TEST_ROOT;
+  process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "pi-sandbox-agentdir-"));
+  process.env.PI_SANDBOX_TEST_ROOT = "/custom/root";
+  try {
+    const config = loadConfig(cwd);
+    assert.ok(config.filesystem?.allowRead?.includes("/custom/root/data"));
+    assert.ok(!config.filesystem?.allowRead?.some((p) => p.includes("${PI_SANDBOX_TEST_ROOT}")));
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    if (originalTestRoot === undefined) delete process.env.PI_SANDBOX_TEST_ROOT;
+    else process.env.PI_SANDBOX_TEST_ROOT = originalTestRoot;
   }
 });
 

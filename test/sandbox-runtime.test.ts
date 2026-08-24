@@ -6,6 +6,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import { canonicalizePath } from "../src/policy.ts";
 import {
   buildRuntimeConfig,
+  extractBlockedReadPath,
   extractBlockedWritePath,
   resolveAllowances,
   supportsNodeEnvProxy,
@@ -66,7 +67,27 @@ test("extractBlockedWritePath recognizes shell sandbox errors", () => {
     extractBlockedWritePath("bash: line 1: /private/file: Operation not permitted"),
     "/private/file",
   );
+  assert.equal(
+    extractBlockedWritePath("cp: cannot create regular file '/private/file': Permission denied"),
+    "/private/file",
+  );
+  assert.equal(
+    extractBlockedWritePath("'/tmp/src' -> '/private/dst': Permission denied"),
+    "/private/dst",
+  );
   assert.equal(extractBlockedWritePath("permission denied"), null);
+});
+
+test("extractBlockedReadPath recognizes shell read-denial errors", () => {
+  assert.equal(
+    extractBlockedReadPath("cat: /private/secret: Permission denied"),
+    "/private/secret",
+  );
+  assert.equal(
+    extractBlockedReadPath("bash: line 1: /private/secret: No such file or directory"),
+    "/private/secret",
+  );
+  assert.equal(extractBlockedReadPath("hello world"), null);
 });
 
 test("supportsNodeEnvProxy observes Node release boundaries", () => {

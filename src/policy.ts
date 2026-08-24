@@ -1,10 +1,17 @@
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path";
 
-export function decideWritePolicy(path: string, allowWrite: string[], denyWrite: string[]) {
-  if (matchesPattern(path, denyWrite)) return "deny";
-  if (allowWrite.length === 0 || !matchesPattern(path, allowWrite)) return "prompt";
+import ignore from "ignore";
+
+export function decideWritePolicy(
+  path: string,
+  allowWrite: string[],
+  denyWrite: string[],
+  cwd: string,
+) {
+  if (matchesPattern(path, denyWrite, cwd)) return "deny";
+  if (allowWrite.length === 0 || !matchesPattern(path, allowWrite, cwd)) return "prompt";
   return "allow";
 }
 
@@ -12,19 +19,21 @@ export async function resolveWritePermission({
   path,
   allowWrite,
   denyWrite,
+  cwd,
   prompt,
   saveWritePermission,
 }: {
   path: string;
   allowWrite: string[];
   denyWrite: string[];
+  cwd: string;
   prompt: (path: string) => Promise<{
     action: "abort" | "session" | "project" | "global";
     value: string;
   }>;
   saveWritePermission: (choice: "session" | "project" | "global", value: string) => Promise<void>;
 }) {
-  const policy = decideWritePolicy(path, allowWrite, denyWrite);
+  const policy = decideWritePolicy(path, allowWrite, denyWrite, cwd);
   if (policy !== "prompt") return { action: policy };
 
   const choice = await prompt(path);
@@ -40,6 +49,33 @@ export function extractDomainsFromCommand(command: string): string[] {
   let match: RegExpExecArray | null;
   while ((match = urlRegex.exec(command)) !== null) domains.add(match[1]);
   return [...domains];
+}
+
+/**
+ * Extract candidate file paths from a bash command string for pre-execution
+ * policy checks. Intentionally broad — false positives are acceptable since
+ * they only produce an extra prompt; false negatives mean a sensitive file
+ * slips through to the OS sandbox layer.
+ *
+ * Matches tokens that look like file paths: optional leading ./ ../ ~/ ${ or /,
+ * followed by word characters, dots, hyphens, with at least one dot in the name
+ * (to avoid matching plain command names like `cat` or `grep`).
+ */
+export function extractPathsFromCommand(command: string): string[] {
+  // Strip comments and quoted strings to reduce noise, then tokenize.
+  const stripped = command
+    .replace(/#[^\n]*/g, "") // strip # comments
+    .replace(/'[^']*'/g, " ") // strip single-quoted strings
+    .replace(/"[^"]*"/g, " "); // strip double-quoted strings (rough)
+
+  const re = /(?:^|[\s=|(;&`])((~\/|\.{1,2}\/|\$\{?\w+\}?\/|\/[\w])[^\s;|&'"<>]*)/g;
+  const paths = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(stripped)) !== null) {
+    const path = match[1]!.replace(/[);,]+$/, ""); // trim trailing punctuation
+    if (path) paths.add(path);
+  }
+  return [...paths];
 }
 
 export function domainMatchesPattern(domain: string, pattern: string): boolean {
@@ -63,6 +99,17 @@ function expandPath(filePath: string): string {
   return resolve(filePath.replace(/^~(?=$|\/)/, homedir()));
 }
 
+/** Expand `${VAR}` references and a leading `~` in a config pattern string. */
+export function expandEnvVars(pattern: string): string {
+  return pattern
+    .replace(/\$\{([^}]+)\}/g, (_, name) => process.env[name] ?? `\${${name}}`)
+    .replace(/^~(?=$|\/)/, homedir());
+}
+
+export function expandPatternList(patterns: string[]): string[] {
+  return patterns.map(expandEnvVars);
+}
+
 export function canonicalizePath(filePath: string): string {
   const absolutePath = expandPath(filePath);
   try {
@@ -84,15 +131,53 @@ export function canonicalizePath(filePath: string): string {
   }
 }
 
-export function matchesPattern(filePath: string, patterns: string[]): boolean {
+/**
+ * Matches a file path against a list of patterns. Absolute patterns (and
+ * globs) are matched directly against the canonicalized path. Relative
+ * patterns are matched against the path relative to `cwd` using gitignore
+ * semantics (via the `ignore` package), so entries like `.env` or `*.pem`
+ * behave the way they would in a `.gitignore` file.
+ */
+export function matchesPattern(filePath: string, patterns: string[], cwd: string): boolean {
   const absolutePath = canonicalizePath(filePath);
-  return patterns.some((pattern) => {
-    const absolutePattern = pattern.includes("*") ? expandPath(pattern) : canonicalizePath(pattern);
-    if (pattern.includes("*")) {
-      const escaped = absolutePattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
-      return new RegExp(`^${escaped}$`).test(absolutePath);
+  const relativePatterns: string[] = [];
+  const absolutePatterns: string[] = [];
+  for (const pattern of patterns) {
+    // Classify on the pattern itself (after ~ expansion only) — `resolve()`
+    // inside expandPath would make every pattern look absolute, since it
+    // resolves relative patterns against the process cwd.
+    const homeExpanded = pattern.replace(/^~(?=$|\/)/, homedir());
+    if (isAbsolute(homeExpanded)) {
+      absolutePatterns.push(expandPath(pattern));
+    } else {
+      relativePatterns.push(pattern);
     }
-    const separator = absolutePattern.endsWith("/") ? "" : "/";
-    return absolutePath === absolutePattern || absolutePath.startsWith(absolutePattern + separator);
-  });
+  }
+
+  for (const absolutePattern of absolutePatterns) {
+    if (absolutePattern.includes("*")) {
+      const escaped = absolutePattern
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*\*/g, "[^]*")
+        .replace(/\*/g, "[^/]*");
+      if (new RegExp(`^${escaped}$`).test(absolutePath)) return true;
+    } else {
+      const separator = absolutePattern.endsWith("/") ? "" : "/";
+      if (
+        absolutePath === absolutePattern ||
+        absolutePath.startsWith(absolutePattern + separator)
+      ) {
+        return true;
+      }
+    }
+  }
+
+  if (relativePatterns.length > 0) {
+    const rel = relative(cwd, absolutePath);
+    if (!rel.startsWith("..") && !isAbsolute(rel)) {
+      if (ignore().add(relativePatterns).ignores(rel)) return true;
+    }
+  }
+
+  return false;
 }

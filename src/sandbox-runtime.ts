@@ -108,11 +108,60 @@ export function supportsNodeEnvProxy(version: string): boolean {
   return (major === 22 && minor >= 21) || major >= 24;
 }
 
+/**
+ * Patterns that indicate a write was denied by the OS sandbox.
+ * Covers: shell built-in errors, common coreutils (cp, mv, tee, install, rsync),
+ * and generic "permission denied" / "read-only file system" syscall errors.
+ */
+export const WRITE_BLOCK_PATTERNS: RegExp[] = [
+  // Shell: bash/sh: [line N:] /path: Operation not permitted
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Oo]peration not permitted/,
+  // Shell: bash/sh: [line N:] /path: Permission denied
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Pp]ermission denied/,
+  // coreutils write errors: cannot create/open/write to '/path'
+  /cannot (?:create|open|write to)(?: regular file)? ['"]?(\/[^\s'"]+)['"]?/,
+  // cp/mv/install: '/src' -> '/dst': Permission denied  (dst is what's blocked)
+  /['"]?(\/[^\s'"]+)['"]? -> ['"]?(\/[^\s'"]+)['"]?: (?:[Pp]ermission denied|[Oo]peration not permitted)/,
+  // tee, redirect: /path: Permission denied
+  /(\/[^\s:]+): [Pp]ermission denied/,
+  // Read-only file system
+  /(\/[^\s:]+): [Rr]ead-only file system/,
+];
+
+/** Patterns that indicate a read was denied by the OS sandbox. */
+export const READ_BLOCK_PATTERNS: RegExp[] = [
+  // Shell: bash/sh: [line N:] /path: Permission denied  (reads surface this way too)
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Pp]ermission denied/,
+  // cat, head, tail, grep, etc: /path: Permission denied
+  /(\/[^\s:]+): [Pp]ermission denied/,
+  // open/cannot open: /path: Permission denied
+  /(?:cannot open|failed to open|error opening) ['"]?(\/[^\s'"]+)['"]?.*[Pp]ermission denied/,
+  // No such file — bubblewrap hides denied paths as ENOENT on some kernels
+  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): No such file or directory/,
+];
+
+/** Extract a blocked path from sandbox output using the given pattern set. */
+export function extractBlockedPath(patterns: RegExp[], output: string): string | null {
+  for (const pattern of patterns) {
+    const match = output.match(pattern);
+    if (match) {
+      // Last capture group is the relevant path (dst for src->dst patterns).
+      const captured = match.slice(1).filter(Boolean);
+      const path = captured[captured.length - 1];
+      if (path) return path;
+    }
+  }
+  return null;
+}
+
+/** Extract a path from a bash "Operation not permitted" / "Permission denied" OS sandbox error. */
 export function extractBlockedWritePath(output: string): string | null {
-  const match = output.match(
-    /(?:\/bin\/bash|bash|sh): (?:line \d: )?(\/[^\s:]+): Operation not permitted/,
-  );
-  return match ? match[1] : null;
+  return extractBlockedPath(WRITE_BLOCK_PATTERNS, output);
+}
+
+/** Extract a path from a bash read-denial OS sandbox error. */
+export function extractBlockedReadPath(output: string): string | null {
+  return extractBlockedPath(READ_BLOCK_PATTERNS, output);
 }
 
 export function createSandboxedBashOps(shellPath?: string, sshProxy = true): BashOperations {

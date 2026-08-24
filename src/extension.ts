@@ -18,17 +18,20 @@ import {
   canonicalizePath,
   domainIsAllowed,
   extractDomainsFromCommand,
+  extractPathsFromCommand,
   matchesPattern,
   resolveWritePermission,
 } from "./policy.ts";
 import {
   createSandboxedBashOps,
-  extractBlockedWritePath,
+  extractBlockedPath,
   initializeSandbox,
+  READ_BLOCK_PATTERNS,
   reinitializeSandbox,
   resolveAllowances,
   type SessionAllowances,
   supportsNodeEnvProxy,
+  WRITE_BLOCK_PATTERNS,
 } from "./sandbox-runtime.ts";
 import {
   formatSandboxConfiguration,
@@ -185,9 +188,11 @@ export default function (pi: ExtensionAPI) {
       try {
         result = await runBash();
       } catch (error) {
-        if (!(error instanceof Error) || !error.message.includes("Operation not permitted")) {
-          throw error;
-        }
+        if (!(error instanceof Error)) throw error;
+        const isSandboxError =
+          error.message.includes("Operation not permitted") ||
+          error.message.includes("Permission denied");
+        if (!isSandboxError) throw error;
         result = {
           content: [
             {
@@ -204,15 +209,16 @@ export default function (pi: ExtensionAPI) {
           .filter((content: any) => content.type === "text")
           .map((content: any) => content.text)
           .join("\n");
-        const blockedPath = extractBlockedWritePath(output);
+        const blockedWritePath = extractBlockedPath(WRITE_BLOCK_PATTERNS, output);
 
-        if (blockedPath) {
-          const path = canonicalizePath(blockedPath);
+        if (blockedWritePath) {
+          const path = canonicalizePath(blockedWritePath);
           const config = loadConfig(ctx.cwd);
           const writePermission = await resolveWritePermission({
             path,
             allowWrite: effectiveWritePaths(ctx.cwd),
             denyWrite: config.filesystem?.denyWrite ?? [],
+            cwd: ctx.cwd,
             prompt: (path) =>
               promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
             saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
@@ -235,6 +241,34 @@ export default function (pi: ExtensionAPI) {
               details: {},
             });
             return runBash();
+          }
+        }
+
+        // Read block — only surfaces in output when a write block wasn't already found.
+        if (!blockedWritePath) {
+          const blockedReadPath = extractBlockedPath(READ_BLOCK_PATTERNS, output);
+          if (blockedReadPath) {
+            const path = canonicalizePath(blockedReadPath);
+            const config = loadConfig(ctx.cwd);
+            const choice = await promptReadBlock(
+              pi,
+              ctx,
+              path,
+              config.permissionPromptTimeoutSeconds,
+            );
+            if (choice.action !== "abort") {
+              await applyChoice(choice.action, "read", choice.value, ctx.cwd);
+              onUpdate?.({
+                content: [
+                  {
+                    type: "text",
+                    text: `\n--- Read access granted for "${choice.value}", retrying ---\n`,
+                  },
+                ],
+                details: {},
+              });
+              return runBash();
+            }
           }
         }
       }
@@ -299,11 +333,48 @@ export default function (pi: ExtensionAPI) {
           await applyChoice(choice.action, "domain", choice.value, ctx.cwd);
         }
       }
+
+      // denyRead / denyWrite pre-check: enforce gitignore-style relative patterns
+      // (e.g. `.env`, `*.pem`) before the command runs. The OS sandbox layer only
+      // sees expanded absolute paths and cannot apply these semantics itself.
+      const denyRead = config.filesystem?.denyRead ?? [];
+      const denyWrite = config.filesystem?.denyWrite ?? [];
+      if (denyRead.length > 0 || denyWrite.length > 0) {
+        for (const candidate of extractPathsFromCommand(event.input.command)) {
+          if (denyWrite.length > 0 && matchesPattern(candidate, denyWrite, ctx.cwd)) {
+            return {
+              block: true,
+              reason:
+                `Sandbox: "${candidate}" matches denyWrite. ` +
+                `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+            };
+          }
+          if (
+            denyRead.length > 0 &&
+            matchesPattern(candidate, denyRead, ctx.cwd) &&
+            !matchesPattern(candidate, effectiveReadPaths(ctx.cwd), ctx.cwd)
+          ) {
+            const choice = await promptReadBlock(
+              pi,
+              ctx,
+              candidate,
+              config.permissionPromptTimeoutSeconds,
+            );
+            if (choice.action === "abort") {
+              return {
+                block: true,
+                reason: `Sandbox: read access denied for "${candidate}" (matches denyRead).`,
+              };
+            }
+            await applyChoice(choice.action, "read", choice.value, ctx.cwd);
+          }
+        }
+      }
     }
 
     if (isToolCallEventType("read", event)) {
       const path = canonicalizePath(event.input.path);
-      if (!matchesPattern(path, effectiveReadPaths(ctx.cwd))) {
+      if (!matchesPattern(path, effectiveReadPaths(ctx.cwd), ctx.cwd)) {
         const choice = await promptReadBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
         if (choice.action === "abort") {
           return { block: true, reason: `Sandbox: read access denied for "${path}"` };
@@ -319,6 +390,7 @@ export default function (pi: ExtensionAPI) {
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
         denyWrite: config.filesystem?.denyWrite ?? [],
+        cwd: ctx.cwd,
         prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });
@@ -407,7 +479,9 @@ export default function (pi: ExtensionAPI) {
         (value) => {
           if (!value) return "Rule cannot be empty.";
           const matches =
-            kind === "domain" ? domainIsAllowed(target, [value]) : matchesPattern(target, [value]);
+            kind === "domain"
+              ? domainIsAllowed(target, [value])
+              : matchesPattern(target, [value], ctx.cwd);
           return matches ? null : `Rule must match "${target}".`;
         },
         config.permissionPromptTimeoutSeconds,

@@ -4,6 +4,8 @@ import { dirname, join } from "node:path";
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
+import { expandPatternList } from "./policy.ts";
+
 export type SandboxConfig = Omit<SandboxRuntimeConfig, "network"> & {
   enabled?: boolean;
   permissionPromptTimeoutSeconds?: number;
@@ -169,7 +171,16 @@ export function loadConfig(cwd: string): SandboxConfig {
   const { globalPath, projectPath } = getConfigPaths(cwd);
   const globalConfig = readJsonConfig(globalPath, true);
   const projectConfig = readJsonConfig(projectPath, true);
-  return mergeConfigLayers(DEFAULT_CONFIG, globalConfig, projectConfig);
+  const merged = mergeConfigLayers(DEFAULT_CONFIG, globalConfig, projectConfig);
+
+  if (merged.filesystem) {
+    const filesystem = merged.filesystem;
+    if (filesystem.denyRead) filesystem.denyRead = expandPatternList(filesystem.denyRead);
+    if (filesystem.allowRead) filesystem.allowRead = expandPatternList(filesystem.allowRead);
+    if (filesystem.allowWrite) filesystem.allowWrite = expandPatternList(filesystem.allowWrite);
+    if (filesystem.denyWrite) filesystem.denyWrite = expandPatternList(filesystem.denyWrite);
+  }
+  return merged;
 }
 
 function writeConfigFile(configPath: string, config: SandboxConfigFile): void {
