@@ -53,13 +53,11 @@ export function extractDomainsFromCommand(command: string): string[] {
 
 /**
  * Extract candidate file paths from a bash command string for pre-execution
- * policy checks. Intentionally broad — false positives are acceptable since
- * they only produce an extra prompt; false negatives mean a sensitive file
- * slips through to the OS sandbox layer.
- *
- * Matches tokens that look like file paths: optional leading ./ ../ ~/ ${ or /,
- * followed by word characters, dots, hyphens, with at least one dot in the name
- * (to avoid matching plain command names like `cat` or `grep`).
+ * policy checks. Only tokens that already look like paths are matched — a
+ * leading ./ ../ ~/ ${VAR}/ or / — so bare names like `cat .env` are left to
+ * the OS sandbox layer. False positives cost an extra prompt (denyRead) or an
+ * unnecessary block (denyWrite); false negatives mean a sensitive file is
+ * only caught post-execution by the OS sandbox.
  */
 export function extractPathsFromCommand(command: string): string[] {
   // Strip comments and quoted strings to reduce noise, then tokenize.
