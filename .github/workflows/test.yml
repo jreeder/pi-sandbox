@@ -15,10 +15,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-      - run: npm ci
-      - run: npm run ci:fmt
-      - run: npm run ci:lint
-      - run: npm run ci:check
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run ci:fmt
+      - run: pnpm run ci:lint
+      - run: pnpm run ci:check
+      - run: pnpm run ci:test

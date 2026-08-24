@@ -60,30 +60,36 @@ pi install npm:pi-sandbox
 ```
 
 #### Configure
-Add a config like this either to `~/.pi/agent/sandbox.json` (global) or to `.pi/sandbox.json` (local).
-Local config takes precedence over global.
+Add a config like this either to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`) or to `.pi/sandbox.json` (local).
+Scalar settings in the local config take precedence over global settings. The
+path and domain arrays from both files are combined and deduplicated, so a
+project can add permissions without repeating the global configuration. Built-in
+defaults are used for an array only when neither file configures it.
 
 Note below that the order of precedence for filesystem read and write are opposite.
 
 ```json
 {
   "enabled": true,
+  "permissionPromptTimeoutSeconds": 600, // Defaults to 10 minutes; 0 waits indefinitely
   "allowBrowserProcess": true,     // If you want to use agent-browser or similar Chrome setup
   "network": {
     "allowLocalBinding": true,     // ditto
     "allowAllUnixSockets": true,   // ditto
+    "allowUnauthenticatedSocksProxy": true, // Enables Git-over-SSH on macOS
     "allowedDomains": ["github.com", "*.github.com"],
     "deniedDomains": []
   },
   "filesystem": {
     // For READS:
-    // - ANY read is prompted unless the path is already in allowRead
+    // - ANY read is prompted unless the path is in allowRead or allowWrite
     // - Granting a prompt adds to allowRead, which overrides denyRead
     // - denyRead is not a hard-block; it just marks regions as denied by default
     "denyRead": ["/Users", "/home"],
     "allowRead": [".", "~/.config", "~/.local", "Library"],
 
     // For WRITES:
+    // - allowWrite also grants read access to the same paths
     // - empty ALLOW means no write access at all
     // - DENY takes precedence and is never prompted
     "allowWrite": [".", "/tmp"],
@@ -95,8 +101,14 @@ Note below that the order of precedence for filesystem read and write are opposi
 #### Usage
 
 ```
-pi --no-sandbox          disable sandboxing for the session
-/sandbox                 show current configuration and session allowances
+pi --no-sandbox                  disable sandboxing for the session
+Alt+S                            toggle sandboxing on/off for the session
+/sandbox                         show current configuration and session allowances
+/sandbox-enable                  enable the sandbox for this session
+/sandbox-disable                 disable the sandbox for this session
+/sandbox-allow domain <url>      prompt to add a domain to allowedDomains
+/sandbox-allow read <path>       prompt to add a path to allowRead
+/sandbox-allow write <path>      prompt to add a path to allowWrite
 ```
 
 ## What it does
@@ -109,12 +121,15 @@ checked against the same filesystem policy. The OS-level sandbox cannot cover
 these tools because they run directly in the Node.js process rather than in a
 subprocess.
 
-When a block is triggered, a prompt appears with four options:
+When a block is triggered, a prompt appears with four options. Permission prompts
+automatically select **Abort (keep blocked)** after 10 minutes by default. Set
+`permissionPromptTimeoutSeconds` to a positive number to use a different timeout,
+or set it to `0` to wait indefinitely. A timeout never grants permission.
 
 - Abort (keep blocked)
 - Allow for this session only
 - Allow for this project — written to `.pi/sandbox.json`
-- Allow for all projects — written to `~/.pi/agent/sandbox.json`
+- Allow for all projects — written to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`)
 
 **Session allowances** are held in memory only. They are never written to disk
 and the agent has no way to read or modify them. They are reset when the
@@ -125,7 +140,7 @@ extension reloads or pi restarts.
 | Rule | Behaviour |
 |------|-----------|
 | Domain not in `allowedDomains` | Prompted (bash and `!cmd`) |
-| Path not in `allowRead` | Prompted (read tool); granting adds to `allowRead` |
+| Path not in `allowRead` or `allowWrite` | Prompted (read tool); granting adds to `allowRead` |
 | Path not in `allowWrite` | Prompted (write/edit tools and bash write failures) |
 | Path in `denyWrite` | Hard-blocked, no prompt |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
@@ -137,18 +152,25 @@ files to check.
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it
 removes per-domain prompts and can be easy to add accidentally. `allowWrite` uses prefix
-matching, so `.` covers the entire current working directory.
+matching, so `.` covers the entire current working directory. Write access also
+implies read access; paths do not need to be repeated in `allowRead`.
+
+`allowUnauthenticatedSocksProxy` is enabled by default on macOS so Git-over-SSH
+works with the built-in `nc`. Domain filtering still applies, but another local process
+that discovers the temporary proxy port can use it while the sandbox is running.
 
 > **⚠️ Read and write have different precedence rules:**
 >
-> - **Read:** Every read is prompted unless the path is already in `allowRead`.
+> - **Read:** Every read is prompted unless the path is in `allowRead` or `allowWrite`.
 >   `denyRead` is not a hard-block — it marks regions as denied by default, but
 >   granting a prompt adds the path to `allowRead`, overriding `denyRead`.
 > - **Write:** `denyWrite` takes precedence over `allowWrite` and is never
 >   prompted. A path in `denyWrite` is always blocked, even if it matches
 >   `allowWrite`.
 
-If neither file exists, built-in defaults apply (see above for the defaults).
+If neither file configures an array, its built-in defaults apply (see above for
+the defaults). Once an array is configured, only its combined global and local
+entries are used, so an explicit empty array disables that default.
 
 The footer shows a lock indicator while the sandbox is active.
 

@@ -1,8 +1,10 @@
 {
   "enabled": true,
+  "permissionPromptTimeoutSeconds": 600,
   "allowBrowserProcess": true,
   "network": {
     "allowLocalBinding": true,
+    "allowUnauthenticatedSocksProxy": true,
     "allowAllUnixSockets": true,
     "allowedDomains": [
       "localhost",
