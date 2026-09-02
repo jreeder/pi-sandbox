@@ -1,5 +1,6 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import {
   SandboxManager,
@@ -33,6 +34,15 @@ const canonicalizeFilesystemPattern = (path: string) =>
 const canonicalizeFilesystemPatterns = (paths: string[]) =>
   unique(paths.map(canonicalizeFilesystemPattern));
 
+function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
+  if (platform !== "linux") return [];
+
+  // apply-seccomp executes inside the Bubblewrap namespace, so broad rules
+  // such as denyRead: ["/home"] must not hide the runtime's bundled helper.
+  const runtimeEntryUrl = import.meta.resolve("@carderne/sandbox-runtime");
+  return [fileURLToPath(new URL("../vendor/seccomp", runtimeEntryUrl))];
+}
+
 export function resolveAllowances(
   config: SandboxConfig,
   allowances?: SessionAllowances,
@@ -60,6 +70,7 @@ export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCa
 export function buildRuntimeConfig(
   config: SandboxConfig,
   allowances?: SessionAllowances,
+  platform: NodeJS.Platform = process.platform,
 ): SandboxRuntimeConfig {
   const effective = resolveAllowances(config, allowances);
 
@@ -72,7 +83,10 @@ export function buildRuntimeConfig(
     filesystem: {
       disabled: config.filesystem?.disabled,
       denyRead: canonicalizeFilesystemPatterns(config.filesystem?.denyRead ?? []),
-      allowRead: canonicalizeFilesystemPatterns(effective.readPaths),
+      allowRead: canonicalizeFilesystemPatterns([
+        ...effective.readPaths,
+        ...sandboxRuntimeReadPaths(platform),
+      ]),
       allowWrite: canonicalizeFilesystemPatterns(effective.writePaths),
       denyWrite: canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? []),
     },
@@ -164,6 +178,98 @@ export function extractBlockedReadPath(output: string): string | null {
   return extractBlockedPath(READ_BLOCK_PATTERNS, output);
 }
 
+const EXIT_STDIO_GRACE_MS = 100;
+
+/**
+ * Wait for a child process to exit without hanging on inherited stdio handles.
+ *
+ * After exit, keep reading while output is active. If a detached descendant
+ * holds the pipes open but leaves them idle, release them after a short grace.
+ */
+function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let exited = false;
+    let exitCode: number | null = null;
+    let postExitTimer: NodeJS.Timeout | undefined;
+    let stdoutEnded = child.stdout === null;
+    let stderrEnded = child.stderr === null;
+
+    const cleanup = () => {
+      if (postExitTimer) {
+        clearTimeout(postExitTimer);
+        postExitTimer = undefined;
+      }
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+      child.removeListener("close", onClose);
+      child.stdout?.removeListener("end", onStdoutEnd);
+      child.stderr?.removeListener("end", onStderrEnd);
+      child.stdout?.removeListener("data", onData);
+      child.stderr?.removeListener("data", onData);
+    };
+
+    const finalize = (code: number | null) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+      resolve(code);
+    };
+
+    const maybeFinalizeAfterExit = () => {
+      if (!exited || settled) return;
+      if (stdoutEnded && stderrEnded) finalize(exitCode);
+    };
+
+    const armIdleTimer = () => {
+      if (postExitTimer) clearTimeout(postExitTimer);
+      postExitTimer = setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS);
+    };
+
+    const onData = () => {
+      if (exited && !settled) armIdleTimer();
+    };
+
+    const onStdoutEnd = () => {
+      stdoutEnded = true;
+      maybeFinalizeAfterExit();
+    };
+
+    const onStderrEnd = () => {
+      stderrEnded = true;
+      maybeFinalizeAfterExit();
+    };
+
+    const onError = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+
+    const onExit = (code: number | null) => {
+      exited = true;
+      exitCode = code;
+      maybeFinalizeAfterExit();
+      if (!settled) armIdleTimer();
+    };
+
+    const onClose = (code: number | null) => {
+      finalize(code);
+    };
+
+    child.stdout?.once("end", onStdoutEnd);
+    child.stderr?.once("end", onStderrEnd);
+    child.stdout?.on("data", onData);
+    child.stderr?.on("data", onData);
+    child.once("error", onError);
+    child.once("exit", onExit);
+    child.once("close", onClose);
+  });
+}
+
 export function createSandboxedBashOps(shellPath?: string, sshProxy = true): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
@@ -185,51 +291,46 @@ export function createSandboxedBashOps(shellPath?: string, sshProxy = true): Bas
         shell,
       );
 
-      return new Promise((resolve, reject) => {
-        const child = spawn(shell, [...args, wrappedCommand], {
-          cwd,
-          env,
-          detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-
-        let timedOut = false;
-        let timeoutHandle: NodeJS.Timeout | undefined;
-
-        const killProcessGroup = () => {
-          if (!child.pid) return;
-          try {
-            process.kill(-child.pid, "SIGKILL");
-          } catch {
-            child.kill("SIGKILL");
-          }
-        };
-
-        if (timeout !== undefined && timeout > 0) {
-          timeoutHandle = setTimeout(() => {
-            timedOut = true;
-            killProcessGroup();
-          }, timeout * 1000);
-        }
-
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
-        child.on("error", (error) => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          reject(error);
-        });
-
-        signal?.addEventListener("abort", killProcessGroup, { once: true });
-        child.on("close", (code) => {
-          if (timeoutHandle) clearTimeout(timeoutHandle);
-          signal?.removeEventListener("abort", killProcessGroup);
-          SandboxManager.cleanupAfterCommand();
-
-          if (signal?.aborted) reject(new Error("aborted"));
-          else if (timedOut) reject(new Error(`timeout:${timeout}`));
-          else resolve({ exitCode: code });
-        });
+      const child = spawn(shell, [...args, wrappedCommand], {
+        cwd,
+        env,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
       });
+
+      let timedOut = false;
+      let timeoutHandle: NodeJS.Timeout | undefined;
+
+      const killProcessGroup = () => {
+        if (!child.pid) return;
+        try {
+          process.kill(-child.pid, "SIGKILL");
+        } catch {
+          child.kill("SIGKILL");
+        }
+      };
+
+      if (timeout !== undefined && timeout > 0) {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          killProcessGroup();
+        }, timeout * 1000);
+      }
+
+      child.stdout?.on("data", onData);
+      child.stderr?.on("data", onData);
+      signal?.addEventListener("abort", killProcessGroup, { once: true });
+
+      try {
+        const exitCode = await waitForChildProcess(child);
+        if (signal?.aborted) throw new Error("aborted");
+        if (timedOut) throw new Error(`timeout:${timeout}`);
+        return { exitCode };
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        signal?.removeEventListener("abort", killProcessGroup);
+        SandboxManager.cleanupAfterCommand();
+      }
     },
   };
 }

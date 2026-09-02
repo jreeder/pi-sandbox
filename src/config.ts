@@ -8,6 +8,7 @@ import { expandPatternList } from "./policy.ts";
 
 export type SandboxConfig = Omit<SandboxRuntimeConfig, "network"> & {
   enabled?: boolean;
+  sandboxUserShell?: boolean;
   permissionPromptTimeoutSeconds?: number;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
@@ -28,6 +29,7 @@ export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
 
 export const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
+  sandboxUserShell: true,
   permissionPromptTimeoutSeconds: DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
   network: {
     allowUnauthenticatedSocksProxy: process.platform === "darwin",
