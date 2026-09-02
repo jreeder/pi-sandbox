@@ -16,7 +16,9 @@ import {
 } from "./config.ts";
 import {
   canonicalizePath,
+  decideBashPathPolicy,
   domainIsAllowed,
+  expandCommandToken,
   extractDomainsFromCommand,
   extractPathsFromCommand,
   matchesPattern,
@@ -335,40 +337,42 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // denyRead / denyWrite pre-check: enforce gitignore-style relative patterns
-      // (e.g. `.env`, `*.pem`) before the command runs. The OS sandbox layer only
-      // sees expanded absolute paths and cannot apply these semantics itself.
-      const denyRead = config.filesystem?.denyRead ?? [];
+      // Path pre-check: candidate paths in the command are checked before it
+      // runs. denyWrite matches are hard-blocked; anything outside the
+      // effective read paths prompts, mirroring the read tool's allow-list
+      // semantics. The OS sandbox can't do this — it only deny-lists reads.
       const denyWrite = config.filesystem?.denyWrite ?? [];
-      if (denyRead.length > 0 || denyWrite.length > 0) {
-        for (const candidate of extractPathsFromCommand(event.input.command)) {
-          if (denyWrite.length > 0 && matchesPattern(candidate, denyWrite, ctx.cwd)) {
+      for (const token of extractPathsFromCommand(event.input.command)) {
+        const candidate = expandCommandToken(token);
+        if (candidate === null) continue;
+        const policy = decideBashPathPolicy(
+          candidate,
+          effectiveReadPaths(ctx.cwd),
+          denyWrite,
+          ctx.cwd,
+        );
+        if (policy === "deny") {
+          return {
+            block: true,
+            reason:
+              `Sandbox: "${candidate}" matches denyWrite. ` +
+              `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+          };
+        }
+        if (policy === "prompt") {
+          const choice = await promptReadBlock(
+            pi,
+            ctx,
+            candidate,
+            config.permissionPromptTimeoutSeconds,
+          );
+          if (choice.action === "abort") {
             return {
               block: true,
-              reason:
-                `Sandbox: "${candidate}" matches denyWrite. ` +
-                `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
+              reason: `Sandbox: read access denied for "${candidate}" (not in allowRead).`,
             };
           }
-          if (
-            denyRead.length > 0 &&
-            matchesPattern(candidate, denyRead, ctx.cwd) &&
-            !matchesPattern(candidate, effectiveReadPaths(ctx.cwd), ctx.cwd)
-          ) {
-            const choice = await promptReadBlock(
-              pi,
-              ctx,
-              candidate,
-              config.permissionPromptTimeoutSeconds,
-            );
-            if (choice.action === "abort") {
-              return {
-                block: true,
-                reason: `Sandbox: read access denied for "${candidate}" (matches denyRead).`,
-              };
-            }
-            await applyChoice(choice.action, "read", choice.value, ctx.cwd);
-          }
+          await applyChoice(choice.action, "read", choice.value, ctx.cwd);
         }
       }
     }
