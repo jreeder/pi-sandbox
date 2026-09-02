@@ -150,7 +150,7 @@ extension reloads or pi restarts.
 | Path not in `allowRead` or `allowWrite` | Prompted (read tool); granting adds to `allowRead` |
 | Path not in `allowWrite` | Prompted (write/edit tools and bash write failures) |
 | Path in `denyWrite` | Hard-blocked, no prompt |
-| Path in `denyRead` referenced by a bash command | Prompted before the command runs; granting adds to `allowRead` |
+| Path referenced by a bash command not in `allowRead` or `allowWrite` | Prompted before the command runs; granting adds to `allowRead` |
 | Path in `denyWrite` referenced by a bash command | Hard-blocked before the command runs, no prompt |
 | Bash output indicates a read the OS sandbox denied | Prompted after the command runs, same as write blocks |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
@@ -161,12 +161,19 @@ files to check.
 
 Bash commands are also scanned for candidate file paths (best-effort — only
 tokens that already look like a path, e.g. `./`, `../`, `~/`, `${VAR}/`, or an
-absolute path) before they run, so `denyRead`/`denyWrite` rules apply
-pre-execution instead of only surfacing after the OS sandbox blocks the
-command. `denyRead` and `denyWrite` entries without a leading `/` (e.g.
-`.env`, `*.pem`) are matched using gitignore semantics relative to the
-working directory, the same way they'd behave in a `.gitignore` file.
-Entries starting with `/` are matched as absolute path prefixes or globs.
+absolute path) before they run. A candidate matching `denyWrite` hard-blocks
+the command; a candidate outside `allowRead`/`allowWrite` prompts before the
+command runs, the same allow-list semantics as the read tool — this matters
+because the OS sandbox only deny-lists reads, so paths outside `denyRead`
+would otherwise be silently readable from bash. Expect prompts for system
+paths a command merely mentions (`/usr/bin/...`, `/dev/null`, `/etc/...`);
+grant them once with a broad rule or pre-add them to `allowRead`. `$VAR` and
+`${VAR}` references in candidates are expanded from the environment; tokens
+referencing unset variables are skipped and left to the OS sandbox backstop.
+`denyRead` and `denyWrite` entries without a leading `/` (e.g. `.env`,
+`*.pem`) are matched using gitignore semantics relative to the working
+directory, the same way they'd behave in a `.gitignore` file. Entries
+starting with `/` are matched as absolute path prefixes or globs.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it

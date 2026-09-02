@@ -15,6 +15,44 @@ export function decideWritePolicy(
   return "allow";
 }
 
+/**
+ * Decide how a candidate path referenced by a bash command is handled before
+ * the command runs: `denyWrite` matches are hard-blocked; anything outside the
+ * effective read paths (allowRead + allowWrite + session grants) prompts, the
+ * same allow-list semantics the read tool uses. The OS sandbox cannot provide
+ * this — it only deny-lists reads, so paths outside `denyRead` would otherwise
+ * be silently readable from bash.
+ */
+export function decideBashPathPolicy(
+  path: string,
+  readPaths: string[],
+  denyWrite: string[],
+  cwd: string,
+): "deny" | "prompt" | "allow" {
+  if (denyWrite.length > 0 && matchesPattern(path, denyWrite, cwd)) return "deny";
+  if (!matchesPattern(path, readPaths, cwd)) return "prompt";
+  return "allow";
+}
+
+/**
+ * Expand `$VAR` and `${VAR}` in a path token extracted from a bash command.
+ * Returns null when a referenced variable is unset — the token's real target
+ * is unknowable pre-execution, so the caller should skip it and rely on the
+ * OS sandbox as the backstop rather than prompt for a garbled path.
+ */
+export function expandCommandToken(token: string): string | null {
+  let unresolved = false;
+  const expanded = token.replace(/\$(?:\{(\w+)\}|(\w+))/g, (_, braced, bare) => {
+    const value = process.env[braced ?? bare];
+    if (value === undefined) {
+      unresolved = true;
+      return "";
+    }
+    return value;
+  });
+  return unresolved ? null : expanded;
+}
+
 export async function resolveWritePermission({
   path,
   allowWrite,
@@ -54,10 +92,12 @@ export function extractDomainsFromCommand(command: string): string[] {
 /**
  * Extract candidate file paths from a bash command string for pre-execution
  * policy checks. Only tokens that already look like paths are matched — a
- * leading ./ ../ ~/ ${VAR}/ or / — so bare names like `cat .env` are left to
- * the OS sandbox layer. False positives cost an extra prompt (denyRead) or an
- * unnecessary block (denyWrite); false negatives mean a sensitive file is
- * only caught post-execution by the OS sandbox.
+ * leading ./ ../ ~/ ${VAR}/ or /, including a bare `/` (or `//`) token so
+ * root traversals like `find /` are caught — while bare names like `cat .env`
+ * are left to the OS sandbox layer. False positives cost an extra prompt
+ * (paths outside allowRead) or an unnecessary block (denyWrite); false
+ * negatives mean a sensitive file is only caught post-execution by the OS
+ * sandbox.
  */
 export function extractPathsFromCommand(command: string): string[] {
   // Strip comments and quoted strings to reduce noise, then tokenize.
@@ -66,7 +106,11 @@ export function extractPathsFromCommand(command: string): string[] {
     .replace(/'[^']*'/g, " ") // strip single-quoted strings
     .replace(/"[^"]*"/g, " "); // strip double-quoted strings (rough)
 
-  const re = /(?:^|[\s=|(;&`])((~\/|\.{1,2}\/|\$\{?\w+\}?\/|\/[\w])[^\s;|&'"<>]*)/g;
+  // Path-like token alternatives: relative/home/env-var prefixes, absolute
+  // paths (`/+` tolerates `//etc`-style doubled slashes; `[\w.]` admits
+  // hidden files like /.dockerenv), and a token of only slashes (`find /`).
+  const re =
+    /(?:^|[\s=|(;&`])((?:~\/|\.{1,2}\/|\$\{?\w+\}?\/|\/+[\w.])[^\s;|&'"<>]*|\/+(?![^\s;|&'"<>]))/g;
   const paths = new Set<string>();
   let match: RegExpExecArray | null;
   while ((match = re.exec(stripped)) !== null) {

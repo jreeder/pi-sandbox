@@ -8,8 +8,10 @@ import assert from "node:assert/strict";
 import {
   allowsAllDomains,
   canonicalizePath,
+  decideBashPathPolicy,
   decideWritePolicy,
   domainIsAllowed,
+  expandCommandToken,
   expandEnvVars,
   extractDomainsFromCommand,
   extractPathsFromCommand,
@@ -159,6 +161,16 @@ test("extractPathsFromCommand pulls plausible file paths and ignores quoted stri
   assert.deepEqual(extractPathsFromCommand("cat /etc/passwd"), ["/etc/passwd"]);
 });
 
+test("extractPathsFromCommand catches root traversals and slash variants", () => {
+  assert.deepEqual(extractPathsFromCommand("find / -name secrets"), ["/"]);
+  assert.deepEqual(extractPathsFromCommand("du -sh /"), ["/"]);
+  assert.deepEqual(extractPathsFromCommand("find // -type f"), ["//"]);
+  assert.deepEqual(extractPathsFromCommand("cat //etc/passwd"), ["//etc/passwd"]);
+  assert.deepEqual(extractPathsFromCommand("cat /.dockerenv"), ["/.dockerenv"]);
+  // Slashes inside URLs and mid-token are not candidates.
+  assert.deepEqual(extractPathsFromCommand("curl https://example.com/path"), []);
+});
+
 test("canonicalizes symlinks and nonexistent descendants", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-canonical-"));
   const real = join(root, "real");
@@ -169,4 +181,41 @@ test("canonicalizes symlinks and nonexistent descendants", () => {
     canonicalizePath(join(link, "new", "file")),
     join(canonicalizePath(real), "new", "file"),
   );
+});
+
+test("decideBashPathPolicy hard-blocks denyWrite and prompts outside the read allow-list", () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-bashpolicy-"));
+  const readPaths = [cwd, "/tmp"];
+  const denyWrite = ["*.pem", join(homedir(), ".ssh")];
+
+  assert.equal(decideBashPathPolicy(join(cwd, "src/main.ts"), readPaths, denyWrite, cwd), "allow");
+  assert.equal(decideBashPathPolicy("/tmp/scratch.txt", readPaths, denyWrite, cwd), "allow");
+  // Outside allowRead/allowWrite: prompt, even though nothing deny-lists it.
+  assert.equal(
+    decideBashPathPolicy(join(homedir(), ".orbstack/config"), readPaths, denyWrite, cwd),
+    "prompt",
+  );
+  assert.equal(decideBashPathPolicy("/etc/passwd", readPaths, denyWrite, cwd), "prompt");
+  // denyWrite wins over everything, without a prompt.
+  assert.equal(decideBashPathPolicy(join(cwd, "cert.pem"), readPaths, denyWrite, cwd), "deny");
+  assert.equal(
+    decideBashPathPolicy(join(homedir(), ".ssh/id_rsa"), readPaths, denyWrite, cwd),
+    "deny",
+  );
+});
+
+test("expandCommandToken expands $VAR and ${VAR}, returning null for unset variables", () => {
+  const original = process.env.PI_SANDBOX_TEST_VAR;
+  process.env.PI_SANDBOX_TEST_VAR = "/custom/path";
+  delete process.env.PI_SANDBOX_UNSET_VAR;
+  try {
+    assert.equal(expandCommandToken("${PI_SANDBOX_TEST_VAR}/file"), "/custom/path/file");
+    assert.equal(expandCommandToken("$PI_SANDBOX_TEST_VAR/file"), "/custom/path/file");
+    assert.equal(expandCommandToken("~/plain/token"), "~/plain/token");
+    assert.equal(expandCommandToken("${PI_SANDBOX_UNSET_VAR}/file"), null);
+    assert.equal(expandCommandToken("$PI_SANDBOX_UNSET_VAR/file"), null);
+  } finally {
+    if (original === undefined) delete process.env.PI_SANDBOX_TEST_VAR;
+    else process.env.PI_SANDBOX_TEST_VAR = original;
+  }
 });
