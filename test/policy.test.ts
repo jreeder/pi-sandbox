@@ -161,6 +161,16 @@ test("extractPathsFromCommand pulls plausible file paths and ignores quoted stri
   assert.deepEqual(extractPathsFromCommand("cat /etc/passwd"), ["/etc/passwd"]);
 });
 
+test("extractPathsFromCommand catches root traversals and slash variants", () => {
+  assert.deepEqual(extractPathsFromCommand("find / -name secrets"), ["/"]);
+  assert.deepEqual(extractPathsFromCommand("du -sh /"), ["/"]);
+  assert.deepEqual(extractPathsFromCommand("find // -type f"), ["//"]);
+  assert.deepEqual(extractPathsFromCommand("cat //etc/passwd"), ["//etc/passwd"]);
+  assert.deepEqual(extractPathsFromCommand("cat /.dockerenv"), ["/.dockerenv"]);
+  // Slashes inside URLs and mid-token are not candidates.
+  assert.deepEqual(extractPathsFromCommand("curl https://example.com/path"), []);
+});
+
 test("canonicalizes symlinks and nonexistent descendants", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-canonical-"));
   const real = join(root, "real");
