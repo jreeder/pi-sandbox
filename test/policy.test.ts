@@ -113,6 +113,18 @@ test("path patterns support directory prefixes and globs", () => {
   assert.equal(matchesPattern(join(root, "file.txt"), [join(root, "*.pem")], root), false);
 });
 
+test("blanket '.' and bare relative directory patterns anchor to cwd", () => {
+  const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-cwd-")));
+  // "." must cover the entire working directory (default allowRead/allowWrite).
+  assert.equal(matchesPattern(join(root, "src", "policy.ts"), ["."], root), true);
+  assert.equal(matchesPattern(root, ["."], root), true);
+  assert.equal(matchesPattern("/etc/passwd", ["."], root), false);
+  // A bare directory name anchors to cwd like the pre-refactor prefix matching.
+  assert.equal(matchesPattern(join(root, "Library", "x"), ["Library"], root), true);
+  // A path equal to cwd must not throw when only glob relative patterns exist.
+  assert.equal(matchesPattern(root, ["*.pem"], root), false);
+});
+
 test("relative patterns are matched with gitignore semantics under cwd", () => {
   const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-gitignore-")));
   assert.equal(matchesPattern(join(root, ".env"), [".env"], root), true);

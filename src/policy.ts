@@ -148,6 +148,13 @@ export function matchesPattern(filePath: string, patterns: string[], cwd: string
     if (isAbsolute(homeExpanded)) {
       absolutePatterns.push(expandPath(pattern));
     } else {
+      // Relative patterns match two ways: gitignore semantics under cwd, and
+      // (for non-globs) as cwd-anchored path prefixes, so entries like "."
+      // (the whole working directory) or "Library" keep their directory
+      // meaning — gitignore has no equivalent of ".".
+      if (!pattern.includes("*")) {
+        absolutePatterns.push(canonicalizePath(resolve(cwd, pattern)));
+      }
       relativePatterns.push(pattern);
     }
   }
@@ -172,7 +179,9 @@ export function matchesPattern(filePath: string, patterns: string[], cwd: string
 
   if (relativePatterns.length > 0) {
     const rel = relative(cwd, absolutePath);
-    if (!rel.startsWith("..") && !isAbsolute(rel)) {
+    // rel is "" when the path IS cwd — ignore() throws on empty paths, and
+    // the cwd-anchored prefix branch above already covers that case.
+    if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) {
       if (ignore().add(relativePatterns).ignores(rel)) return true;
     }
   }
