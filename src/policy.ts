@@ -212,10 +212,13 @@ export function matchesPattern(
 
   for (const absolutePattern of absolutePatterns) {
     if (absolutePattern.includes("*")) {
+      // Single pass so no replacement is rewritten by a later one: `**/` is
+      // zero or more directories, `**` crosses segments, `*` stays in one.
       const escaped = absolutePattern
         .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-        .replace(/\*\*/g, "[^]*")
-        .replace(/\*/g, "[^/]*");
+        .replace(/\*\*\/|\*\*|\*/g, (glob) =>
+          glob === "**/" ? "(?:.*/)?" : glob === "**" ? ".*" : "[^/]*",
+        );
       if (new RegExp(`^${escaped}$`).test(absolutePath)) return true;
     } else {
       const separator = absolutePattern.endsWith("/") ? "" : "/";

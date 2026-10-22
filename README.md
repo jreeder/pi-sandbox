@@ -12,6 +12,59 @@ automatically granting permissions or retrying the command.
 
 ![demo](./demo/demo.gif)
 
+## About this fork
+
+This is a fork of [carderne/pi-sandbox](https://github.com/carderne/pi-sandbox)
+that tracks upstream releases (currently synced to upstream 0.7.2) and adds
+stricter filesystem policy checks on top. The OS-level sandbox and runtime
+configuration are unchanged from upstream; the differences are all in the
+extension's own policy layer.
+
+`pi install npm:pi-sandbox` installs the upstream package, without these changes.
+To use this fork, install it from git:
+
+```bash
+pi install git:github.com/jreeder/pi-sandbox
+```
+
+### Differences from upstream
+
+- **Bash commands are checked against the filesystem policy before they run.**
+  Upstream relies on the OS sandbox for bash, and the OS sandbox only
+  deny-lists reads: anything outside `denyRead` is silently readable from bash.
+  This fork scans each bash command for path-like tokens (`./`, `../`, `~/`,
+  `${VAR}/`, absolute paths, and a bare `/`) and checks them before execution:
+  - a path matching `denyWrite` hard-blocks the command;
+  - a path outside `allowRead`/`allowWrite` prompts, with the same allow-list
+    semantics as the read tool. Granting adds the path to `allowRead`.
+
+  `$VAR`/`${VAR}` in tokens are expanded from the environment; tokens that
+  reference an unset variable are skipped and left to the OS sandbox. The scan
+  is best-effort: bare names (`cat .env`) and paths built at runtime are not
+  detected. Expect prompts for system paths a command merely mentions
+  (`/usr/bin/...`, `/dev/null`); pre-add them to `allowRead` or grant a broad
+  rule once.
+- **Relative patterns use gitignore semantics.** In `allowRead`, `denyRead`,
+  `allowWrite` and `denyWrite`, an entry without a leading `/` or `~` (e.g.
+  `.env`, `*.pem`, `Library`) is matched relative to the session working
+  directory the way it would be in a `.gitignore` file, so it matches at any
+  depth. `.env` matches `./sub/.env`, not just `./.env`. Non-glob relative
+  entries also still match as a directory prefix under the working directory,
+  so `.` keeps meaning "the whole working directory".
+- **`*` in absolute patterns stays within one path segment.** `/tmp/*` matches
+  `/tmp/a` but not `/tmp/a/b`; use `**` to cross segments (`/tmp/**`), and
+  `**/` matches zero or more directories (`/tmp/**/*.pem` matches `/tmp/c.pem`).
+  Upstream's `*` matches across `/`.
+- **Environment variables in config patterns.** Filesystem patterns may use
+  `${VAR}` (e.g. `"${HOME}/secrets"`), expanded when the config is loaded and
+  applied to both the tool checks and the OS sandbox. Unset variables are left
+  as literal text.
+
+These differences apply to the read/write/edit tool checks and the bash
+pre-check. The OS sandbox receives the same patterns as upstream, so on Linux
+glob entries in `allowWrite`/`denyWrite` are still unenforced at the OS level
+(see [Configure](#configure)).
+
 ## Notes
 There is an example config at [sandbox.json](./sandbox.json). It was quite a few things added to get this extension to work with [agent-browser](https://agent-browser.dev/) and other common tools.
 
@@ -190,10 +243,10 @@ paths a command merely mentions (`/usr/bin/...`, `/dev/null`, `/etc/...`);
 grant them once with a broad rule or pre-add them to `allowRead`. `$VAR` and
 `${VAR}` references in candidates are expanded from the environment; tokens
 referencing unset variables are skipped and left to the OS sandbox backstop.
-`denyRead` and `denyWrite` entries without a leading `/` (e.g. `.env`,
-`*.pem`) are matched using gitignore semantics relative to the working
-directory, the same way they'd behave in a `.gitignore` file. Entries
-starting with `/` are matched as absolute path prefixes or globs.
+Filesystem entries without a leading `/` or `~` (e.g. `.env`, `*.pem`) are
+matched using gitignore semantics relative to the working directory, the same
+way they'd behave in a `.gitignore` file. Entries starting with `/` or `~` are
+matched as absolute path prefixes or globs.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it
