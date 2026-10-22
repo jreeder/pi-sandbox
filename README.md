@@ -52,7 +52,9 @@ pi install git:github.com/jreeder/pi-sandbox
   entries also still match as a directory prefix under the working directory,
   so `.` keeps meaning "the whole working directory".
 - **`*` in absolute patterns stays within one path segment.** `/tmp/*` matches
-  `/tmp/a` but not `/tmp/a/b`. Upstream's `*` matches across `/`.
+  `/tmp/a` but not `/tmp/a/b`; use `**` to cross segments (`/tmp/**`), and
+  `**/` matches zero or more directories (`/tmp/**/*.pem` matches `/tmp/c.pem`).
+  Upstream's `*` matches across `/`.
 - **Environment variables in config patterns.** Filesystem patterns may use
   `${VAR}` (e.g. `"${HOME}/secrets"`), expanded when the config is loaded and
   applied to both the tool checks and the OS sandbox. Unset variables are left

@@ -115,6 +115,23 @@ test("path patterns support directory prefixes and globs", () => {
   assert.equal(matchesPattern(join(root, "file.txt"), [join(root, "*.pem")], root), false);
 });
 
+test("absolute globs: * stays within a segment, ** crosses segments", () => {
+  const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-policy-")));
+  assert.equal(matchesPattern(join(root, "a"), [join(root, "*")], root), true);
+  assert.equal(matchesPattern(join(root, "a", "b"), [join(root, "*")], root), false);
+  assert.equal(matchesPattern(join(root, "a"), [join(root, "**")], root), true);
+  assert.equal(matchesPattern(join(root, "a", "b", "c"), [join(root, "**")], root), true);
+  assert.equal(
+    matchesPattern(join(root, "a", "b", "c.pem"), [join(root, "**", "*.pem")], root),
+    true,
+  );
+  assert.equal(matchesPattern(join(root, "c.pem"), [join(root, "**", "*.pem")], root), true);
+  assert.equal(
+    matchesPattern(join(root, "a", "b", "c.txt"), [join(root, "**", "*.pem")], root),
+    false,
+  );
+});
+
 test("blanket '.' and bare relative directory patterns anchor to cwd", () => {
   const root = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-cwd-")));
   // "." must cover the entire working directory (default allowRead/allowWrite).
