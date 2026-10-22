@@ -59,11 +59,31 @@ pi install git:github.com/jreeder/pi-sandbox
   `${VAR}` (e.g. `"${HOME}/secrets"`), expanded when the config is loaded and
   applied to both the tool checks and the OS sandbox. Unset variables are left
   as literal text.
+- **Pi's own credential files are always denied.** `auth.json` (API keys) and
+  `mcp-oauth/` (MCP OAuth tokens) in Pi's agent directory (`~/.pi/agent` by
+  default; respects `PI_CODING_AGENT_DIR`) are added to `credentials.files` with
+  `mode: "deny"` on every config load, alongside any entries you declare. The OS
+  sandbox makes them unreadable from bash even when an ancestor such as `~/.pi`
+  is in `allowRead`, and the read/write/edit tools and the bash pre-check
+  hard-block them with no prompt. The tools also hard-block every other
+  `credentials.files` entry, including `mode: "mask"` ones: they run outside the
+  OS sandbox, so they would otherwise see the real contents.
+- **Fixes not yet in upstream:**
+  - Disabling the sandbox clears session-only grants, so re-enabling starts
+    clean, and removes `NODE_USE_ENV_PROXY` if the extension set it. The
+    variable is shared by every session in the process (e.g. subagents), so it
+    is removed only when the last sandboxed session releases it.
+  - Domain detection for bash commands catches hosts the previous pattern
+    missed: single-character labels (`https://x.com`), IP addresses,
+    `user:pass@host` URLs, and upper-case hosts.
+  - The footer shows `Sandbox: disabled` when the sandbox is off (via
+    `--no-sandbox`, config, a toggle, or a failed initialization) instead of
+    clearing the indicator.
 
-These differences apply to the read/write/edit tool checks and the bash
-pre-check. The OS sandbox receives the same patterns as upstream, so on Linux
-glob entries in `allowWrite`/`denyWrite` are still unenforced at the OS level
-(see [Configure](#configure)).
+The pattern-matching differences apply to the read/write/edit tool checks and
+the bash pre-check. The OS sandbox receives the same filesystem patterns as
+upstream, so on Linux glob entries in `allowWrite`/`denyWrite` are still
+unenforced at the OS level (see [Configure](#configure)).
 
 ## Notes
 There is an example config at [sandbox.json](./sandbox.json). It was quite a few things added to get this extension to work with [agent-browser](https://agent-browser.dev/) and other common tools.
@@ -217,6 +237,7 @@ consistently.
 | Path not in `allowRead` or `allowWrite` | Prompted (read tool); granting adds to `allowRead` |
 | Path not in `allowWrite` | Prompted (write/edit tools) |
 | Path in `denyWrite` | Hard-blocked, no prompt |
+| Path in `credentials.files` (includes Pi's `auth.json` and `mcp-oauth/`) | Hard-blocked for read/write/edit and the bash pre-check, no prompt; `deny` entries are also unreadable from bash at the OS level |
 | Path referenced by a bash command not in `allowRead` or `allowWrite` | Prompted before the command runs; granting adds to `allowRead` |
 | Path in `denyWrite` referenced by a bash command | Hard-blocked before the command runs, no prompt |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
@@ -287,7 +308,7 @@ If neither file configures an array, its built-in defaults apply (see above for
 the defaults). Once an array is configured, only its combined global and local
 entries are used, so an explicit empty array disables that default.
 
-The footer shows a lock indicator while the sandbox is active.
+The footer shows a lock indicator while the sandbox is active, and `Sandbox: disabled` while it is off.
 
 ## Ackowledgements
 Based on code from

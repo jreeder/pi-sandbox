@@ -253,6 +253,27 @@ export function getConfigPaths(cwd: string): { globalPath: string; projectPath: 
   };
 }
 
+/**
+ * Pi's own credential stores (API keys and MCP OAuth tokens). loadConfig always
+ * declares them in `credentials.files` with `mode: "deny"`, so they stay
+ * unreadable even when an ancestor such as `~/.pi` is in allowRead.
+ */
+export function piCredentialPaths(): string[] {
+  const agentDir = getAgentDir();
+  return [join(agentDir, "auth.json"), join(agentDir, "mcp-oauth")];
+}
+
+function withPiCredentials(
+  credentials: SandboxConfig["credentials"],
+): NonNullable<SandboxConfig["credentials"]> {
+  const files = credentials?.files ?? [];
+  const listed = new Set(files.map((file) => file.path));
+  const missing = piCredentialPaths()
+    .filter((path) => !listed.has(path))
+    .map((path) => ({ path, mode: "deny" as const }));
+  return { ...credentials, files: [...files, ...missing] };
+}
+
 export function loadConfig(cwd: string, projectTrusted = true): SandboxConfig {
   const { globalPath, projectPath } = getConfigPaths(cwd);
   const globalConfig = readJsonConfig(globalPath, true);
@@ -266,6 +287,7 @@ export function loadConfig(cwd: string, projectTrusted = true): SandboxConfig {
     if (filesystem.allowWrite) filesystem.allowWrite = expandPatternList(filesystem.allowWrite);
     if (filesystem.denyWrite) filesystem.denyWrite = expandPatternList(filesystem.denyWrite);
   }
+  merged.credentials = withPiCredentials(merged.credentials);
   return merged;
 }
 

@@ -16,6 +16,7 @@ import {
 } from "./config.ts";
 import {
   canonicalizePath,
+  credentialFilePaths,
   decideBashPathPolicy,
   domainIsAllowed,
   expandCommandToken,
@@ -30,7 +31,9 @@ import {
   updateSandboxConfig,
   resolveAllowances,
   type SessionAllowances,
-  supportsNodeEnvProxy,
+  acquireNodeEnvProxy,
+  clearSessionAllowances,
+  releaseNodeEnvProxy,
 } from "./sandbox-runtime.ts";
 import {
   formatSandboxConfiguration,
@@ -60,6 +63,16 @@ export default function (pi: ExtensionAPI) {
   let sandboxEnabled = false;
   let sandboxInitialized = false;
   let projectTrusted = false;
+  // Whether the session asked for NODE_USE_ENV_PROXY, and whether it currently
+  // holds it (released on disable and shutdown).
+  let nodeEnvProxyRequested = false;
+  let holdsNodeEnvProxy = false;
+
+  function releaseProxyEnvironment(): void {
+    if (!holdsNodeEnvProxy) return;
+    releaseNodeEnvProxy(process.env);
+    holdsNodeEnvProxy = false;
+  }
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
 
   const effectiveAllowances = (cwd: string) =>
@@ -112,6 +125,10 @@ export default function (pi: ExtensionAPI) {
     ctx.ui.setStatus("sandbox", ctx.ui.theme.fg("accent", formatSandboxStatus(config)));
   }
 
+  function setDisabledStatus(ctx: Parameters<typeof warnIfAllDomainsAllowed>[0]) {
+    ctx.ui.setStatus("sandbox", `Sandbox: ${ctx.ui.theme.fg("error", "disabled")}`);
+  }
+
   async function enableSandbox(
     ctx: Parameters<typeof warnIfAllDomainsAllowed>[0],
     setProxyEnvironment: boolean,
@@ -125,13 +142,15 @@ export default function (pi: ExtensionAPI) {
     const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
+      setDisabledStatus(ctx);
       return false;
     }
 
     try {
       await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
-      if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
-        process.env.NODE_USE_ENV_PROXY ??= "1";
+      if (setProxyEnvironment) nodeEnvProxyRequested = true;
+      if (nodeEnvProxyRequested && !holdsNodeEnvProxy) {
+        holdsNodeEnvProxy = acquireNodeEnvProxy(process.env, process.versions.node);
       }
       sandboxEnabled = true;
       sandboxInitialized = true;
@@ -145,6 +164,7 @@ export default function (pi: ExtensionAPI) {
         `Sandbox initialization failed: ${error instanceof Error ? error.message : error}`,
         "error",
       );
+      setDisabledStatus(ctx);
       return false;
     }
   }
@@ -166,7 +186,11 @@ export default function (pi: ExtensionAPI) {
     }
     sandboxEnabled = false;
     sandboxInitialized = false;
-    ctx.ui.setStatus("sandbox", "");
+    // Session grants and the proxy env var belong to this enabled period; a
+    // later re-enable must not inherit them.
+    clearSessionAllowances(allowances);
+    releaseProxyEnvironment();
+    setDisabledStatus(ctx);
     return true;
   }
 
@@ -261,6 +285,12 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig(ctx.cwd, projectTrusted);
     if (!config.enabled) return;
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
+    const credentialBlock = (path: string) => ({
+      block: true,
+      reason:
+        `Sandbox: "${path}" is a protected credential file (credentials.files); ` +
+        `access is always denied.`,
+    });
 
     if (sandboxInitialized && isToolCallEventType("bash", event)) {
       for (const domain of extractDomainsFromCommand(event.input.command)) {
@@ -286,9 +316,11 @@ export default function (pi: ExtensionAPI) {
       // effective read paths prompts, mirroring the read tool's allow-list
       // semantics. The OS sandbox can't do this — it only deny-lists reads.
       const denyWrite = config.filesystem?.denyWrite ?? [];
+      const credentialDeny = credentialFilePaths(config.credentials, true);
       for (const token of extractPathsFromCommand(event.input.command)) {
         const candidate = expandCommandToken(token);
         if (candidate === null) continue;
+        if (matchesPattern(candidate, credentialDeny, ctx.cwd)) return credentialBlock(candidate);
         const policy = decideBashPathPolicy(
           candidate,
           effectiveReadPaths(ctx.cwd),
@@ -323,6 +355,9 @@ export default function (pi: ExtensionAPI) {
 
     if (isToolCallEventType("read", event)) {
       const path = canonicalizePath(event.input.path, ctx.cwd);
+      if (matchesPattern(path, credentialFilePaths(config.credentials), ctx.cwd)) {
+        return credentialBlock(path);
+      }
       if (!matchesPattern(path, effectiveReadPaths(ctx.cwd), ctx.cwd)) {
         const choice = await promptReadBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
         if (choice.action === "abort") {
@@ -335,6 +370,9 @@ export default function (pi: ExtensionAPI) {
 
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
       const path = canonicalizePath((event.input as { path: string }).path, ctx.cwd);
+      if (matchesPattern(path, credentialFilePaths(config.credentials), ctx.cwd)) {
+        return credentialBlock(path);
+      }
       const writePermission = await resolveWritePermission({
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
@@ -368,17 +406,20 @@ export default function (pi: ExtensionAPI) {
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
+      setDisabledStatus(ctx);
       return;
     }
     if (!loadConfig(ctx.cwd, projectTrusted).enabled) {
       sandboxEnabled = false;
       ctx.ui.notify("Sandbox disabled via config", "info");
+      setDisabledStatus(ctx);
       return;
     }
     await enableSandbox(ctx, true);
   });
 
   pi.on("session_shutdown", async () => {
+    releaseProxyEnvironment();
     if (!sandboxInitialized) return;
     try {
       await sandboxManager.reset();

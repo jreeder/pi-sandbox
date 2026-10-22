@@ -35,6 +35,22 @@ export function decideBashPathPolicy(
 }
 
 /**
+ * Paths declared in `credentials.files`. The read/write/edit tools run in
+ * pi's own process, outside the OS sandbox, so they would see a masked file's
+ * real contents: they block every declared path. Bash runs inside the sandbox,
+ * where mask mode substitutes the contents, so its pre-check only needs the
+ * `deny` entries (`denyOnly`).
+ */
+export function credentialFilePaths(
+  credentials: { files?: { path: string; mode: string }[] } | undefined,
+  denyOnly = false,
+): string[] {
+  return (credentials?.files ?? [])
+    .filter((file) => !denyOnly || file.mode === "deny")
+    .map((file) => file.path);
+}
+
+/**
  * Expand `$VAR` and `${VAR}` in a path token extracted from a bash command.
  * Returns null when a referenced variable is unset — the token's real target
  * is unknowable pre-execution, so the caller should skip it and rely on the
@@ -81,11 +97,23 @@ export async function resolveWritePermission({
   return { action: "granted", value: choice.value };
 }
 
+/**
+ * Extract hosts from literal http(s) URLs in a command, skipping userinfo
+ * (`user:pass@`) and lowercasing. Hosts built from shell expansions
+ * (`https://$HOST/`), single-label names (`localhost`) and IPv6 literals are
+ * skipped; the OS sandbox proxy still enforces whatever is connected to.
+ */
 export function extractDomainsFromCommand(command: string): string[] {
-  const urlRegex = /https?:\/\/([a-zA-Z0-9][a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
+  // The host is the leading run of hostname characters, so trailing shell
+  // punctuation (`,` `;` `&&` `)`) ends it. A host that runs into `$`, `{`, `%`
+  // or `_` is being built by an expansion and its real value is unknown.
+  const urlRegex = /https?:\/\/(?:[^\s/?#@]*@)?([a-z0-9.-]+)(?![\w$%{])/gi;
   const domains = new Set<string>();
   let match: RegExpExecArray | null;
-  while ((match = urlRegex.exec(command)) !== null) domains.add(match[1]);
+  while ((match = urlRegex.exec(command)) !== null) {
+    const host = match[1]!.toLowerCase().replace(/\.+$/, "");
+    if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) domains.add(host);
+  }
   return [...domains];
 }
 

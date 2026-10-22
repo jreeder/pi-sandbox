@@ -15,6 +15,7 @@ import {
   getConfigPaths,
   loadConfig,
   mergeConfigLayers,
+  piCredentialPaths,
 } from "../src/config.ts";
 
 test("omitted settings use their defaults", () => {
@@ -140,6 +141,45 @@ test("loadConfig expands env vars and ~ in filesystem patterns", () => {
     else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
     if (originalTestRoot === undefined) delete process.env.PI_SANDBOX_TEST_ROOT;
     else process.env.PI_SANDBOX_TEST_ROOT = originalTestRoot;
+  }
+});
+
+test("loadConfig always denies pi's credential files, alongside user credentials", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-creds-"));
+  const agentDir = join(root, "agent");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  mkdirSync(agentDir);
+  try {
+    const authJson = join(agentDir, "auth.json");
+    const mcpOAuth = join(agentDir, "mcp-oauth");
+    assert.deepEqual(piCredentialPaths(), [authJson, mcpOAuth]);
+    assert.deepEqual(loadConfig(root).credentials?.files, [
+      { path: authJson, mode: "deny" },
+      { path: mcpOAuth, mode: "deny" },
+    ]);
+
+    // User entries are kept; a pi path the user already lists is not duplicated.
+    writeFileSync(
+      join(agentDir, "sandbox.json"),
+      JSON.stringify({
+        credentials: {
+          files: [
+            { path: "/srv/token", mode: "deny" },
+            { path: authJson, mode: "mask" },
+          ],
+        },
+      }),
+    );
+    assert.deepEqual(loadConfig(root).credentials?.files, [
+      { path: "/srv/token", mode: "deny" },
+      { path: authJson, mode: "mask" },
+      { path: mcpOAuth, mode: "deny" },
+    ]);
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

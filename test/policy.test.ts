@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import {
   allowsAllDomains,
   canonicalizePath,
+  credentialFilePaths,
   decideBashPathPolicy,
   decideWritePolicy,
   domainIsAllowed,
@@ -24,6 +25,39 @@ test("extracts and deduplicates literal HTTP domains", () => {
     extractDomainsFromCommand("curl https://api.example.com/a http://api.example.com/b"),
     ["api.example.com"],
   );
+});
+
+test("extracts short, IP, userinfo and mixed-case hosts; skips expansions and single labels", () => {
+  assert.deepEqual(
+    extractDomainsFromCommand(
+      'curl https://x.com/a "https://1.2.3.4:8080/b" https://user:pw@Git.Example.ORG/c HTTPS://y.io.',
+    ),
+    ["x.com", "1.2.3.4", "git.example.org", "y.io"],
+  );
+  assert.deepEqual(
+    extractDomainsFromCommand(
+      "curl https://$HOST/a https://${HOST}/b https://a$B.com http://localhost:3000 http://[::1]/c",
+    ),
+    [],
+  );
+  assert.deepEqual(
+    extractDomainsFromCommand(
+      "curl https://a.com, https://b.com; (curl https://c.com)&& curl https://d.com|x",
+    ),
+    ["a.com", "b.com", "c.com", "d.com"],
+  );
+});
+
+test("credentialFilePaths lists declared files, optionally only deny-mode ones", () => {
+  const credentials = {
+    files: [
+      { path: "/a", mode: "deny" },
+      { path: "/b", mode: "mask" },
+    ],
+  };
+  assert.deepEqual(credentialFilePaths(credentials), ["/a", "/b"]);
+  assert.deepEqual(credentialFilePaths(credentials, true), ["/a"]);
+  assert.deepEqual(credentialFilePaths(undefined), []);
 });
 
 test("matches exact, wildcard, and all-domain policies", () => {
