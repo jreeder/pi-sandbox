@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import {
   addDomainToConfig,
   addReadPathToConfig,
   addWritePathToConfig,
+  stripJsonComments,
   DEFAULT_CONFIG,
   DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
   getConfigPaths,
@@ -22,6 +23,7 @@ test("omitted settings use their defaults", () => {
   assert.equal(DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS, 600);
   assert.equal(merged.permissionPromptTimeoutSeconds, DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS);
   assert.equal(merged.sandboxUserShell, true);
+  assert.equal(merged.network?.allowSSHAgentSocket, undefined);
 });
 
 test("mergeConfigLayers combines configured arrays and deduplicates entries", () => {
@@ -139,6 +141,60 @@ test("loadConfig expands env vars and ~ in filesystem patterns", () => {
     if (originalTestRoot === undefined) delete process.env.PI_SANDBOX_TEST_ROOT;
     else process.env.PI_SANDBOX_TEST_ROOT = originalTestRoot;
   }
+});
+
+test("loadConfig ignores project configuration when the project is untrusted", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-trust-"));
+  const agentDir = join(root, "agent");
+  const projectDir = join(root, "project");
+  const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  mkdirSync(join(projectDir, ".pi"), { recursive: true });
+  mkdirSync(agentDir);
+  writeFileSync(join(agentDir, "sandbox.json"), JSON.stringify({ enabled: false }));
+  writeFileSync(join(projectDir, ".pi", "sandbox.json"), JSON.stringify({ enabled: true }));
+
+  try {
+    assert.equal(loadConfig(projectDir, false).enabled, false);
+    assert.equal(loadConfig(projectDir, true).enabled, true);
+  } finally {
+    if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stripJsonComments removes comments but preserves them inside strings", () => {
+  assert.equal(stripJsonComments('{"a": 1 // trailing\n}'), '{"a": 1 \n}');
+  assert.equal(stripJsonComments('{/* block */"a": 1}'), '{"a": 1}');
+  assert.equal(stripJsonComments('{"url": "http://x/y"}'), '{"url": "http://x/y"}');
+  assert.equal(stripJsonComments('{"s": "a // b"}'), '{"s": "a // b"}');
+});
+
+test("permission writers parse JSONC configs and preserve other sections", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
+  const configPath = join(root, "sandbox.json");
+  writeFileSync(
+    configPath,
+    '{\n  "enabled": true, // keep me\n  "network": { "allowedDomains": ["keep.com"] }\n}\n',
+  );
+
+  addWritePathToConfig(configPath, "/write");
+
+  const written = JSON.parse(readFileSync(configPath, "utf8"));
+  assert.equal(written.enabled, true);
+  assert.deepEqual(written.network.allowedDomains, ["keep.com"]);
+  assert.deepEqual(written.filesystem.allowWrite, ["/write"]);
+});
+
+test("permission writers refuse to overwrite an unparseable config", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-config-"));
+  const configPath = join(root, "sandbox.json");
+  const broken = '{ "enabled": true, oops }';
+  writeFileSync(configPath, broken);
+
+  assert.throws(() => addWritePathToConfig(configPath, "/write"));
+  assert.equal(readFileSync(configPath, "utf8"), broken);
 });
 
 test("permission writers only persist the property being changed", () => {

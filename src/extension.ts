@@ -1,5 +1,5 @@
-import { SandboxManager } from "@carderne/sandbox-runtime";
-import { type AgentToolResult, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createSandboxManager } from "@carderne/sandbox-runtime";
+import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createBashToolDefinition,
   isToolCallEventType,
@@ -26,14 +26,11 @@ import {
 } from "./policy.ts";
 import {
   createSandboxedBashOps,
-  extractBlockedPath,
   initializeSandbox,
-  READ_BLOCK_PATTERNS,
-  reinitializeSandbox,
+  updateSandboxConfig,
   resolveAllowances,
   type SessionAllowances,
   supportsNodeEnvProxy,
-  WRITE_BLOCK_PATTERNS,
 } from "./sandbox-runtime.ts";
 import {
   formatSandboxConfiguration,
@@ -44,24 +41,29 @@ import {
   showPermissionPrompt,
   promptWriteBlock,
   warnIfAllDomainsAllowed,
+  warnIfLinuxUnenforcedGlobs,
 } from "./ui.ts";
 
 export default function (pi: ExtensionAPI) {
+  const sandboxManager = createSandboxManager();
   pi.registerFlag("no-sandbox", {
     description: "Disable OS-level sandboxing for bash commands",
     type: "boolean",
     default: false,
   });
 
-  const localCwd = process.cwd();
-  const userShellPath = SettingsManager.create(localCwd).getShellPath();
-  const localBash = createBashToolDefinition(localCwd, { shellPath: userShellPath });
+  // localBash supplies the tool metadata (name, description, params) via the spread
+  // below. Its execute method is always overridden, and each invocation rebuilds the
+  // bash tool against the session cwd, so this cwd is never used to run commands.
+  const localBash = createBashToolDefinition(process.cwd());
 
   let sandboxEnabled = false;
   let sandboxInitialized = false;
+  let projectTrusted = false;
   const allowances: SessionAllowances = { domains: [], readPaths: [], writePaths: [] };
 
-  const effectiveAllowances = (cwd: string) => resolveAllowances(loadConfig(cwd), allowances);
+  const effectiveAllowances = (cwd: string) =>
+    resolveAllowances(loadConfig(cwd, projectTrusted), allowances);
   const effectiveDomains = (cwd: string) => effectiveAllowances(cwd).domains;
   const effectiveReadPaths = (cwd: string) => effectiveAllowances(cwd).readPaths;
   const effectiveWritePaths = (cwd: string) => effectiveAllowances(cwd).writePaths;
@@ -69,9 +71,9 @@ export default function (pi: ExtensionAPI) {
   async function refreshSandbox(cwd: string): Promise<void> {
     if (!sandboxInitialized) return;
     try {
-      await reinitializeSandbox(loadConfig(cwd), allowances);
+      updateSandboxConfig(sandboxManager, loadConfig(cwd, projectTrusted), allowances, cwd);
     } catch (error) {
-      console.error(`Warning: Failed to reinitialize sandbox: ${error}`);
+      console.error(`Warning: Failed to update sandbox configuration: ${error}`);
     }
   }
 
@@ -84,15 +86,21 @@ export default function (pi: ExtensionAPI) {
     const { globalPath, projectPath } = getConfigPaths(cwd);
     const target = choice === "project" ? projectPath : globalPath;
 
-    if (kind === "domain") {
-      if (!allowances.domains.includes(value)) allowances.domains.push(value);
-      if (choice !== "session") addDomainToConfig(target, value);
-    } else if (kind === "read") {
-      if (!allowances.readPaths.includes(value)) allowances.readPaths.push(value);
-      if (choice !== "session") addReadPathToConfig(target, value);
-    } else {
-      if (!allowances.writePaths.includes(value)) allowances.writePaths.push(value);
-      if (choice !== "session") addWritePathToConfig(target, value);
+    try {
+      if (kind === "domain") {
+        if (!allowances.domains.includes(value)) allowances.domains.push(value);
+        if (choice !== "session") addDomainToConfig(target, value);
+      } else if (kind === "read") {
+        if (!allowances.readPaths.includes(value)) allowances.readPaths.push(value);
+        if (choice !== "session") addReadPathToConfig(target, value);
+      } else {
+        if (!allowances.writePaths.includes(value)) allowances.writePaths.push(value);
+        if (choice !== "session") addWritePathToConfig(target, value);
+      }
+    } catch (error) {
+      // The grant still applies for this session (allowances updated above);
+      // only persistence failed. Surface it instead of wiping the config.
+      console.error(`Warning: ${error instanceof Error ? error.message : error}`);
     }
     await refreshSandbox(cwd);
   }
@@ -113,7 +121,7 @@ export default function (pi: ExtensionAPI) {
       return false;
     }
 
-    const config = loadConfig(ctx.cwd);
+    const config = loadConfig(ctx.cwd, projectTrusted);
     const platform = process.platform;
     if (platform !== "darwin" && platform !== "linux") {
       ctx.ui.notify(`Sandbox not supported on ${platform}`, "warning");
@@ -121,13 +129,14 @@ export default function (pi: ExtensionAPI) {
     }
 
     try {
-      await initializeSandbox(config, allowances);
+      await initializeSandbox(sandboxManager, config, allowances, ctx.cwd);
       if (setProxyEnvironment && supportsNodeEnvProxy(process.versions.node)) {
         process.env.NODE_USE_ENV_PROXY ??= "1";
       }
       sandboxEnabled = true;
       sandboxInitialized = true;
       warnIfAllDomainsAllowed(ctx, config);
+      warnIfLinuxUnenforcedGlobs(ctx, config);
       updateStatus(ctx, config);
       return true;
     } catch (error) {
@@ -150,7 +159,7 @@ export default function (pi: ExtensionAPI) {
 
     if (sandboxInitialized) {
       try {
-        await SandboxManager.reset();
+        await sandboxManager.reset();
       } catch {
         // Ignore cleanup errors.
       }
@@ -174,28 +183,29 @@ export default function (pi: ExtensionAPI) {
     label: "bash (sandboxed)",
     async execute(id, params, signal, onUpdate, ctx) {
       const runBash = () => {
-        if (!sandboxEnabled || !sandboxInitialized) {
-          return localBash.execute(id, params, signal, onUpdate, ctx);
-        }
-        return createBashToolDefinition(localCwd, {
-          operations: createSandboxedBashOps(
-            userShellPath,
-            loadConfig(ctx.cwd).network?.sshProxy !== false,
-          ),
+        const settings = SettingsManager.create(ctx.cwd, undefined, { projectTrusted });
+        const userShellPath = settings.getShellPath();
+        return createBashToolDefinition(ctx.cwd, {
+          operations:
+            sandboxEnabled && sandboxInitialized
+              ? createSandboxedBashOps(
+                  sandboxManager,
+                  userShellPath,
+                  loadConfig(ctx.cwd, projectTrusted).network?.sshProxy !== false,
+                )
+              : undefined,
+          commandPrefix: settings.getShellCommandPrefix(),
           shellPath: userShellPath,
         }).execute(id, params, signal, onUpdate, ctx);
       };
 
-      let result: AgentToolResult<any>;
       try {
-        result = await runBash();
+        return await runBash();
       } catch (error) {
-        if (!(error instanceof Error)) throw error;
-        const isSandboxError =
-          error.message.includes("Operation not permitted") ||
-          error.message.includes("Permission denied");
-        if (!isSandboxError) throw error;
-        result = {
+        if (!(error instanceof Error) || !error.message.includes("Operation not permitted")) {
+          throw error;
+        }
+        return {
           content: [
             {
               type: "text",
@@ -205,83 +215,16 @@ export default function (pi: ExtensionAPI) {
           details: {},
         };
       }
-
-      if (sandboxEnabled && sandboxInitialized && ctx?.hasUI) {
-        const output = result.content
-          .filter((content: any) => content.type === "text")
-          .map((content: any) => content.text)
-          .join("\n");
-        const blockedWritePath = extractBlockedPath(WRITE_BLOCK_PATTERNS, output);
-
-        if (blockedWritePath) {
-          const path = canonicalizePath(blockedWritePath);
-          const config = loadConfig(ctx.cwd);
-          const writePermission = await resolveWritePermission({
-            path,
-            allowWrite: effectiveWritePaths(ctx.cwd),
-            denyWrite: config.filesystem?.denyWrite ?? [],
-            cwd: ctx.cwd,
-            prompt: (path) =>
-              promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
-            saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
-          });
-          if (writePermission.action === "deny") {
-            return result;
-          }
-          if (writePermission.action === "allow") {
-            await refreshSandbox(ctx.cwd);
-            return runBash();
-          }
-          if (writePermission.action === "granted") {
-            onUpdate?.({
-              content: [
-                {
-                  type: "text",
-                  text: `\n--- Write access granted for "${writePermission.value}", retrying ---\n`,
-                },
-              ],
-              details: {},
-            });
-            return runBash();
-          }
-        }
-
-        // Read block — only surfaces in output when a write block wasn't already found.
-        if (!blockedWritePath) {
-          const blockedReadPath = extractBlockedPath(READ_BLOCK_PATTERNS, output);
-          if (blockedReadPath) {
-            const path = canonicalizePath(blockedReadPath);
-            const config = loadConfig(ctx.cwd);
-            const choice = await promptReadBlock(
-              pi,
-              ctx,
-              path,
-              config.permissionPromptTimeoutSeconds,
-            );
-            if (choice.action !== "abort") {
-              await applyChoice(choice.action, "read", choice.value, ctx.cwd);
-              onUpdate?.({
-                content: [
-                  {
-                    type: "text",
-                    text: `\n--- Read access granted for "${choice.value}", retrying ---\n`,
-                  },
-                ],
-                details: {},
-              });
-              return runBash();
-            }
-          }
-        }
-      }
-      return result;
     },
   });
 
   pi.on("user_bash", async (event, ctx) => {
     if (!sandboxEnabled || !sandboxInitialized) return;
 
-    const config = loadConfig(ctx.cwd);
+    const userShellPath = SettingsManager.create(ctx.cwd, undefined, {
+      projectTrusted,
+    }).getShellPath();
+    const config = loadConfig(ctx.cwd, projectTrusted);
     if (config.sandboxUserShell === false) return;
     for (const domain of extractDomainsFromCommand(event.command)) {
       if (!domainIsAllowed(domain, effectiveDomains(ctx.cwd))) {
@@ -306,15 +249,16 @@ export default function (pi: ExtensionAPI) {
     }
     return {
       operations: createSandboxedBashOps(
+        sandboxManager,
         userShellPath,
-        loadConfig(ctx.cwd).network?.sshProxy !== false,
+        loadConfig(ctx.cwd, projectTrusted).network?.sshProxy !== false,
       ),
     };
   });
 
   pi.on("tool_call", async (event, ctx) => {
     if (!sandboxEnabled) return;
-    const config = loadConfig(ctx.cwd);
+    const config = loadConfig(ctx.cwd, projectTrusted);
     if (!config.enabled) return;
     const { projectPath, globalPath } = getConfigPaths(ctx.cwd);
 
@@ -378,7 +322,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (isToolCallEventType("read", event)) {
-      const path = canonicalizePath(event.input.path);
+      const path = canonicalizePath(event.input.path, ctx.cwd);
       if (!matchesPattern(path, effectiveReadPaths(ctx.cwd), ctx.cwd)) {
         const choice = await promptReadBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
         if (choice.action === "abort") {
@@ -390,12 +334,12 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (isToolCallEventType("write", event) || isToolCallEventType("edit", event)) {
-      const path = canonicalizePath((event.input as { path: string }).path);
+      const path = canonicalizePath((event.input as { path: string }).path, ctx.cwd);
       const writePermission = await resolveWritePermission({
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
         denyWrite: config.filesystem?.denyWrite ?? [],
-        cwd: ctx.cwd,
+        baseCwd: ctx.cwd,
         prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
       });
@@ -420,12 +364,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    projectTrusted = ctx.isProjectTrusted();
     if (pi.getFlag("no-sandbox") as boolean) {
       sandboxEnabled = false;
       ctx.ui.notify("Sandbox disabled via --no-sandbox", "warning");
       return;
     }
-    if (!loadConfig(ctx.cwd).enabled) {
+    if (!loadConfig(ctx.cwd, projectTrusted).enabled) {
       sandboxEnabled = false;
       ctx.ui.notify("Sandbox disabled via config", "info");
       return;
@@ -436,7 +381,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (!sandboxInitialized) return;
     try {
-      await SandboxManager.reset();
+      await sandboxManager.reset();
     } catch {
       // Ignore cleanup errors.
     }
@@ -472,8 +417,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const target = kind === "domain" ? targetArg : canonicalizePath(targetArg);
-      const config = loadConfig(ctx.cwd);
+      const target = kind === "domain" ? targetArg : canonicalizePath(targetArg, ctx.cwd);
+      const config = loadConfig(ctx.cwd, projectTrusted);
       const configKey =
         kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
       const choice = await showPermissionPrompt(
@@ -509,7 +454,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(
-        formatSandboxConfiguration(loadConfig(ctx.cwd), getConfigPaths(ctx.cwd), allowances),
+        formatSandboxConfiguration(
+          loadConfig(ctx.cwd, projectTrusted),
+          getConfigPaths(ctx.cwd),
+          allowances,
+        ),
         "info",
       );
     },

@@ -8,10 +8,10 @@ export function decideWritePolicy(
   path: string,
   allowWrite: string[],
   denyWrite: string[],
-  cwd: string,
+  baseCwd: string = process.cwd(),
 ) {
-  if (matchesPattern(path, denyWrite, cwd)) return "deny";
-  if (allowWrite.length === 0 || !matchesPattern(path, allowWrite, cwd)) return "prompt";
+  if (matchesPattern(path, denyWrite, baseCwd)) return "deny";
+  if (allowWrite.length === 0 || !matchesPattern(path, allowWrite, baseCwd)) return "prompt";
   return "allow";
 }
 
@@ -57,21 +57,21 @@ export async function resolveWritePermission({
   path,
   allowWrite,
   denyWrite,
-  cwd,
+  baseCwd,
   prompt,
   saveWritePermission,
 }: {
   path: string;
   allowWrite: string[];
   denyWrite: string[];
-  cwd: string;
+  baseCwd?: string;
   prompt: (path: string) => Promise<{
     action: "abort" | "session" | "project" | "global";
     value: string;
   }>;
   saveWritePermission: (choice: "session" | "project" | "global", value: string) => Promise<void>;
 }) {
-  const policy = decideWritePolicy(path, allowWrite, denyWrite, cwd);
+  const policy = decideWritePolicy(path, allowWrite, denyWrite, baseCwd);
   if (policy !== "prompt") return { action: policy };
 
   const choice = await prompt(path);
@@ -137,8 +137,11 @@ export function domainIsAllowed(domain: string, allowedDomains: string[]): boole
   return allowedDomains.some((pattern) => domainMatchesPattern(domain, pattern));
 }
 
-function expandPath(filePath: string): string {
-  return resolve(filePath.replace(/^~(?=$|\/)/, homedir()));
+function expandPath(filePath: string, baseCwd: string = process.cwd()): string {
+  // Relative entries resolve against the session cwd (baseCwd), not the pi
+  // process cwd — these can differ when pi is embedded in a host process
+  // (e.g. the pi-web UI) whose cwd is not the project directory.
+  return resolve(baseCwd, filePath.replace(/^~(?=$|\/)/, homedir()));
 }
 
 /** Expand `${VAR}` references and a leading `~` in a config pattern string. */
@@ -152,8 +155,8 @@ export function expandPatternList(patterns: string[]): string[] {
   return patterns.map(expandEnvVars);
 }
 
-export function canonicalizePath(filePath: string): string {
-  const absolutePath = expandPath(filePath);
+export function canonicalizePath(filePath: string, baseCwd: string = process.cwd()): string {
+  const absolutePath = expandPath(filePath, baseCwd);
   try {
     return realpathSync.native(absolutePath);
   } catch {
@@ -176,28 +179,32 @@ export function canonicalizePath(filePath: string): string {
 /**
  * Matches a file path against a list of patterns. Absolute patterns (and
  * globs) are matched directly against the canonicalized path. Relative
- * patterns are matched against the path relative to `cwd` using gitignore
+ * patterns are matched against the path relative to `baseCwd` using gitignore
  * semantics (via the `ignore` package), so entries like `.env` or `*.pem`
  * behave the way they would in a `.gitignore` file.
  */
-export function matchesPattern(filePath: string, patterns: string[], cwd: string): boolean {
-  const absolutePath = canonicalizePath(filePath);
+export function matchesPattern(
+  filePath: string,
+  patterns: string[],
+  baseCwd: string = process.cwd(),
+): boolean {
+  const absolutePath = canonicalizePath(filePath, baseCwd);
   const relativePatterns: string[] = [];
   const absolutePatterns: string[] = [];
   for (const pattern of patterns) {
     // Classify on the pattern itself (after ~ expansion only) — `resolve()`
     // inside expandPath would make every pattern look absolute, since it
-    // resolves relative patterns against the process cwd.
+    // resolves relative patterns against baseCwd.
     const homeExpanded = pattern.replace(/^~(?=$|\/)/, homedir());
     if (isAbsolute(homeExpanded)) {
-      absolutePatterns.push(expandPath(pattern));
+      absolutePatterns.push(expandPath(pattern, baseCwd));
     } else {
-      // Relative patterns match two ways: gitignore semantics under cwd, and
-      // (for non-globs) as cwd-anchored path prefixes, so entries like "."
-      // (the whole working directory) or "Library" keep their directory
+      // Relative patterns match two ways: gitignore semantics under baseCwd,
+      // and (for non-globs) as baseCwd-anchored path prefixes, so entries like
+      // "." (the whole working directory) or "Library" keep their directory
       // meaning — gitignore has no equivalent of ".".
       if (!pattern.includes("*")) {
-        absolutePatterns.push(canonicalizePath(resolve(cwd, pattern)));
+        absolutePatterns.push(canonicalizePath(pattern, baseCwd));
       }
       relativePatterns.push(pattern);
     }
@@ -222,7 +229,7 @@ export function matchesPattern(filePath: string, patterns: string[], cwd: string
   }
 
   if (relativePatterns.length > 0) {
-    const rel = relative(cwd, absolutePath);
+    const rel = relative(baseCwd, absolutePath);
     // rel is "" when the path IS cwd — ignore() throws on empty paths, and
     // the cwd-anchored prefix branch above already covers that case.
     if (rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)) {
