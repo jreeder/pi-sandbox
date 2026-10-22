@@ -1,16 +1,15 @@
+import type { ISandboxManager, SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
+
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import {
-  SandboxManager,
-  type SandboxAskCallback,
-  type SandboxRuntimeConfig,
-} from "@carderne/sandbox-runtime";
 import { type BashOperations, getShellConfig } from "@earendil-works/pi-coding-agent";
 
 import { type SandboxConfig } from "./config.ts";
-import { canonicalizePath, domainIsAllowed } from "./policy.ts";
+import { canonicalizePath } from "./policy.ts";
 
 export interface SessionAllowances {
   domains: string[];
@@ -28,11 +27,34 @@ function unique(values: string[]): string[] {
   return [...new Set(values)];
 }
 
-const canonicalizeFilesystemPattern = (path: string) =>
-  path.includes("*") ? path : canonicalizePath(path);
+function resolveSshAgentSocketPath(sshAuthSock: string | undefined): string | undefined {
+  if (!sshAuthSock) return undefined;
+  try {
+    const resolved = realpathSync(sshAuthSock);
+    return statSync(resolved).isSocket() ? resolved : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
-const canonicalizeFilesystemPatterns = (paths: string[]) =>
-  unique(paths.map(canonicalizeFilesystemPattern));
+function resolveUnixSockets(config: SandboxConfig): string[] | undefined {
+  const sockets = [...(config.network?.allowUnixSockets ?? [])];
+  if (config.network?.allowSSHAgentSocket) {
+    const agentSocket = resolveSshAgentSocketPath(process.env.SSH_AUTH_SOCK);
+    if (agentSocket) sockets.push(agentSocket);
+  }
+  if (sockets.length === 0) return config.network?.allowUnixSockets;
+  return unique(sockets);
+}
+
+const canonicalizeFilesystemPatterns = (paths: string[], baseCwd?: string) =>
+  unique(
+    paths.flatMap((path) => {
+      if (path.includes("*")) return [path];
+      const absolutePath = resolve(baseCwd ?? process.cwd(), path.replace(/^~(?=$|\/)/, homedir()));
+      return [absolutePath, canonicalizePath(path, baseCwd)];
+    }),
+  );
 
 function sandboxRuntimeReadPaths(platform: NodeJS.Platform): string[] {
   if (platform !== "linux") return [];
@@ -63,119 +85,88 @@ export function resolveAllowances(
   };
 }
 
-export function createNetworkAskCallback(allowedDomains: string[]): SandboxAskCallback {
-  return async ({ host }) => domainIsAllowed(host, allowedDomains);
-}
-
 export function buildRuntimeConfig(
   config: SandboxConfig,
   allowances?: SessionAllowances,
   platform: NodeJS.Platform = process.platform,
+  baseCwd: string = process.cwd(),
 ): SandboxRuntimeConfig {
   const effective = resolveAllowances(config, allowances);
 
-  return {
+  // When network sandboxing is disabled, omit `allowedDomains` so the runtime's
+  // `needsNetworkRestriction` stays false: no `--unshare-net`, no proxy. The
+  // `network` object itself must remain present — the runtime reads other keys
+  // off it unconditionally (e.g. `network.parentProxy` at initialize). Filesystem
+  // policies are unaffected.
+  // Strip `allowedDomains` from the spread so the disabled branch can truly omit
+  // it (it is re-added below in the non-disabled branch).
+  const {
+    disabled: networkDisabled,
+    allowedDomains: _allowedDomains,
+    allowSSHAgentSocket: _allowSSHAgentSocket,
+    ...networkConfig
+  } = config.network ?? {};
+
+  const runtimeConfig: SandboxRuntimeConfig = {
     network: {
-      ...config.network,
-      allowedDomains: effective.domains,
+      ...networkConfig,
+      // Omit allowedDomains when disabled; the runtime treats `undefined` as
+      // "no network restriction configured".
+      ...(networkDisabled ? {} : { allowedDomains: effective.domains }),
       deniedDomains: config.network?.deniedDomains ?? [],
-    },
+      allowUnixSockets: resolveUnixSockets(config),
+    } as SandboxRuntimeConfig["network"],
     filesystem: {
       disabled: config.filesystem?.disabled,
-      denyRead: canonicalizeFilesystemPatterns(config.filesystem?.denyRead ?? []),
-      allowRead: canonicalizeFilesystemPatterns([
-        ...effective.readPaths,
-        ...sandboxRuntimeReadPaths(platform),
-      ]),
-      allowWrite: canonicalizeFilesystemPatterns(effective.writePaths),
-      denyWrite: canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? []),
-    },
+      denyRead: canonicalizeFilesystemPatterns(config.filesystem?.denyRead ?? [], baseCwd),
+      allowRead: canonicalizeFilesystemPatterns(
+        [...effective.readPaths, ...sandboxRuntimeReadPaths(platform)],
+        baseCwd,
+      ),
+      allowWrite: canonicalizeFilesystemPatterns(effective.writePaths, baseCwd),
+      denyWrite: canonicalizeFilesystemPatterns(config.filesystem?.denyWrite ?? [], baseCwd),
+      // Forwarded for @carderne/sandbox-runtime PR #21. The cast is only
+      // needed until a released runtime type carries the field.
+      denyMandatoryCwdFiles: config.filesystem?.denyMandatoryCwdFiles,
+    } as SandboxRuntimeConfig["filesystem"],
     ignoreViolations: config.ignoreViolations,
+    credentials: config.credentials,
     enableWeakerNestedSandbox: config.enableWeakerNestedSandbox,
     allowBrowserProcess: config.allowBrowserProcess,
     allowPty: config.allowPty,
     enableWeakerNetworkIsolation: true,
+    allowAppleEvents: config.allowAppleEvents,
   };
+
+  return runtimeConfig;
 }
 
 export async function initializeSandbox(
+  manager: ISandboxManager,
   config: SandboxConfig,
   allowances?: SessionAllowances,
+  baseCwd: string = process.cwd(),
 ): Promise<void> {
-  const runtimeConfig = buildRuntimeConfig(config, allowances);
-  await SandboxManager.initialize(
-    runtimeConfig,
-    createNetworkAskCallback(runtimeConfig.network?.allowedDomains ?? []),
-  );
+  const runtimeConfig = buildRuntimeConfig(config, allowances, process.platform, baseCwd);
+  // The runtime checks its live allowlist. Permission prompts happen before
+  // execution; a callback capturing this initial list could re-allow removed domains.
+  await manager.initialize(runtimeConfig);
 }
 
-export async function reinitializeSandbox(
+export function updateSandboxConfig(
+  manager: ISandboxManager,
   config: SandboxConfig,
   allowances: SessionAllowances,
-): Promise<void> {
-  await SandboxManager.reset();
-  await initializeSandbox(config, allowances);
+  baseCwd: string = process.cwd(),
+): void {
+  // Permission updates must not tear down the proxy used by concurrent commands.
+  // Network rules apply immediately; new commands pick up filesystem rules when wrapped.
+  manager.updateConfig(buildRuntimeConfig(config, allowances, process.platform, baseCwd));
 }
 
 export function supportsNodeEnvProxy(version: string): boolean {
   const [major, minor] = version.split(".").map(Number);
   return (major === 22 && minor >= 21) || major >= 24;
-}
-
-/**
- * Patterns that indicate a write was denied by the OS sandbox.
- * Covers: shell built-in errors, common coreutils (cp, mv, tee, install, rsync),
- * and generic "permission denied" / "read-only file system" syscall errors.
- */
-export const WRITE_BLOCK_PATTERNS: RegExp[] = [
-  // Shell: bash/sh: [line N:] /path: Operation not permitted
-  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Oo]peration not permitted/,
-  // Shell: bash/sh: [line N:] /path: Permission denied
-  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Pp]ermission denied/,
-  // coreutils write errors: cannot create/open/write to '/path'
-  /cannot (?:create|open|write to)(?: regular file)? ['"]?(\/[^\s'"]+)['"]?/,
-  // cp/mv/install: '/src' -> '/dst': Permission denied  (dst is what's blocked)
-  /['"]?(\/[^\s'"]+)['"]? -> ['"]?(\/[^\s'"]+)['"]?: (?:[Pp]ermission denied|[Oo]peration not permitted)/,
-  // tee, redirect: /path: Permission denied
-  /(\/[^\s:]+): [Pp]ermission denied/,
-  // Read-only file system
-  /(\/[^\s:]+): [Rr]ead-only file system/,
-];
-
-/** Patterns that indicate a read was denied by the OS sandbox. */
-export const READ_BLOCK_PATTERNS: RegExp[] = [
-  // Shell: bash/sh: [line N:] /path: Permission denied  (reads surface this way too)
-  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): [Pp]ermission denied/,
-  // cat, head, tail, grep, etc: /path: Permission denied
-  /(\/[^\s:]+): [Pp]ermission denied/,
-  // open/cannot open: /path: Permission denied
-  /(?:cannot open|failed to open|error opening) ['"]?(\/[^\s'"]+)['"]?.*[Pp]ermission denied/,
-  // No such file — bubblewrap hides denied paths as ENOENT on some kernels
-  /(?:\/bin\/bash|bash|sh): (?:line \d+: )?(\/[^\s:]+): No such file or directory/,
-];
-
-/** Extract a blocked path from sandbox output using the given pattern set. */
-export function extractBlockedPath(patterns: RegExp[], output: string): string | null {
-  for (const pattern of patterns) {
-    const match = output.match(pattern);
-    if (match) {
-      // Last capture group is the relevant path (dst for src->dst patterns).
-      const captured = match.slice(1).filter(Boolean);
-      const path = captured[captured.length - 1];
-      if (path) return path;
-    }
-  }
-  return null;
-}
-
-/** Extract a path from a bash "Operation not permitted" / "Permission denied" OS sandbox error. */
-export function extractBlockedWritePath(output: string): string | null {
-  return extractBlockedPath(WRITE_BLOCK_PATTERNS, output);
-}
-
-/** Extract a path from a bash read-denial OS sandbox error. */
-export function extractBlockedReadPath(output: string): string | null {
-  return extractBlockedPath(READ_BLOCK_PATTERNS, output);
 }
 
 const EXIT_STDIO_GRACE_MS = 100;
@@ -270,7 +261,11 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
   });
 }
 
-export function createSandboxedBashOps(shellPath?: string, sshProxy = true): BashOperations {
+export function createSandboxedBashOps(
+  manager: ISandboxManager,
+  shellPath?: string,
+  sshProxy = true,
+): BashOperations {
   return {
     async exec(command, cwd, { onData, signal, timeout, env }) {
       if (!existsSync(cwd)) throw new Error(`Working directory does not exist: ${cwd}`);
@@ -281,15 +276,12 @@ export function createSandboxedBashOps(shellPath?: string, sshProxy = true): Bas
       // the sandbox network proxy. Install a shell function so ordinary
       // `ssh host` commands use the runtime's local SOCKS proxy too. This is
       // deliberately opt-in at the config layer, but enabled by default.
-      const socksProxyPort = sshProxy ? SandboxManager.getSocksProxyPort() : undefined;
+      const socksProxyPort = sshProxy ? manager.getSocksProxyPort() : undefined;
       const sshProxyCommand =
         process.platform === "darwin" && socksProxyPort !== undefined
           ? `ssh() { /usr/bin/ssh -o 'ProxyCommand=/usr/bin/nc -X 5 -x localhost:${socksProxyPort} %h %p' "$@"; }; `
           : "";
-      const wrappedCommand = await SandboxManager.wrapWithSandbox(
-        `${sshProxyCommand}${command}`,
-        shell,
-      );
+      const wrappedCommand = await manager.wrapWithSandbox(`${sshProxyCommand}${command}`, shell);
 
       const child = spawn(shell, [...args, wrappedCommand], {
         cwd,
@@ -329,7 +321,7 @@ export function createSandboxedBashOps(shellPath?: string, sshProxy = true): Bas
       } finally {
         if (timeoutHandle) clearTimeout(timeoutHandle);
         signal?.removeEventListener("abort", killProcessGroup);
-        SandboxManager.cleanupAfterCommand();
+        manager.cleanupAfterCommand();
       }
     },
   };

@@ -55,7 +55,7 @@ test("resolves write permission without prompting for denied or allowed paths", 
       path: "/tmp/file",
       allowWrite: ["/tmp"],
       denyWrite: ["/tmp/file"],
-      cwd: "/tmp",
+      baseCwd: "/tmp",
       prompt,
       saveWritePermission: apply,
     }),
@@ -66,7 +66,7 @@ test("resolves write permission without prompting for denied or allowed paths", 
       path: "/tmp/file",
       allowWrite: ["/tmp"],
       denyWrite: [],
-      cwd: "/tmp",
+      baseCwd: "/tmp",
       prompt,
       saveWritePermission: apply,
     }),
@@ -82,7 +82,7 @@ test("resolves write permission prompt choices", async () => {
       path: "/tmp/file",
       allowWrite: [],
       denyWrite: [],
-      cwd: "/tmp",
+      baseCwd: "/tmp",
       prompt: async () => ({ action: "abort", value: "/tmp/file" }),
       saveWritePermission: async (choice, value) => {
         applied.push(`${choice}:${value}`);
@@ -97,7 +97,7 @@ test("resolves write permission prompt choices", async () => {
       path: "/tmp/file",
       allowWrite: [],
       denyWrite: [],
-      cwd: "/tmp",
+      baseCwd: "/tmp",
       prompt: async () => ({ action: "session", value: "/tmp" }),
       saveWritePermission: async (choice, value) => {
         applied.push(`${choice}:${value}`);
@@ -169,6 +169,24 @@ test("extractPathsFromCommand catches root traversals and slash variants", () =>
   assert.deepEqual(extractPathsFromCommand("cat /.dockerenv"), ["/.dockerenv"]);
   // Slashes inside URLs and mid-token are not candidates.
   assert.deepEqual(extractPathsFromCommand("curl https://example.com/path"), []);
+});
+
+test("relative paths resolve against baseCwd, not process.cwd()", () => {
+  const root = mkdtempSync(join(tmpdir(), "pi-sandbox-basecwd-"));
+  const project = canonicalizePath(root);
+
+  // "." and relative entries resolve against the passed baseCwd.
+  assert.equal(canonicalizePath(".", project), project);
+  assert.equal(canonicalizePath("sub/file", project), join(project, "sub", "file"));
+
+  // matchesPattern honors baseCwd for both the path and the pattern.
+  assert.equal(matchesPattern(join(project, "f.txt"), ["."], project), true);
+  assert.equal(matchesPattern("f.txt", ["."], project), true);
+  assert.equal(matchesPattern("f.txt", ["other"], project), false);
+
+  // decideWritePolicy threads baseCwd through to the pattern match.
+  assert.equal(decideWritePolicy("f.txt", ["."], [], project), "allow");
+  assert.equal(decideWritePolicy("f.txt", [], [], project), "prompt");
 });
 
 test("canonicalizes symlinks and nonexistent descendants", () => {
