@@ -15,8 +15,8 @@ import {
   expandCommandToken,
   expandEnvVars,
   extractDomainsFromCommand,
-  isBroadPath,
-  isBroadRule,
+  isRootPath,
+  isRootRule,
   matchesPattern,
   resolveWritePermission,
 } from "../src/policy.ts";
@@ -267,7 +267,7 @@ test("decideBashCandidate hard-blocks deny rules and prompts for reads outside t
   );
 });
 
-test("decideBashCandidate gates low-confidence words on existence and never grants / or home", () => {
+test("decideBashCandidate gates low-confidence words on existence and never grants /", () => {
   const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-bashpolicy-")));
   const options = (mode: "strict" | "tools" | "off", exists: boolean) => ({
     mode,
@@ -289,14 +289,15 @@ test("decideBashCandidate gates low-confidence words on existence and never gran
   assert.equal(decide("/opt/conf", "low", "strict", false), "prompt");
   assert.equal(decide("/opt/conf", "high", "tools", false), "prompt");
   assert.equal(decide("/opt/conf", "high", "off"), "allow");
-  // Root and home: blocked when certain, ignored when merely path-shaped.
-  assert.equal(decide("/", "high", "tools"), "broad");
-  assert.equal(decide("//", "high", "tools"), "broad");
-  assert.equal(decide(homedir(), "high", "tools"), "broad");
+  // Root: blocked when certain, ignored when merely path-shaped.
+  assert.equal(decide("/", "high", "tools"), "root");
+  assert.equal(decide("//", "high", "tools"), "root");
   assert.equal(decide("/", "low", "tools"), "allow");
-  assert.equal(decide("~", "low", "tools"), "allow");
-  assert.equal(decide("/", "low", "strict"), "broad");
-  // A manually configured broad rule is honoured.
+  assert.equal(decide("/", "low", "strict"), "root");
+  // Home is an ordinary path: it prompts like any other.
+  assert.equal(decide(homedir(), "high", "tools"), "prompt");
+  assert.equal(decide("~", "low", "tools"), "prompt");
+  // A manually configured root rule is honoured.
   assert.equal(
     decideBashCandidate(
       { path: "/", access: "read", confidence: "high" },
@@ -306,22 +307,10 @@ test("decideBashCandidate gates low-confidence words on existence and never gran
   );
 });
 
-test("isBroadRule rejects root and home rules in any spelling", () => {
+test("isRootRule rejects root rules in any spelling and allows home", () => {
   const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-broad-")));
-  for (const rule of [
-    "/",
-    "//",
-    "/*",
-    "/**",
-    "/**/",
-    "~",
-    "~/",
-    "~/**",
-    "${HOME}",
-    "$HOME/*",
-    homedir(),
-  ]) {
-    assert.equal(isBroadRule(rule, cwd), true, rule);
+  for (const rule of ["/", "//", "/*", "/**", "/**/"]) {
+    assert.equal(isRootRule(rule, cwd), true, rule);
   }
   for (const rule of [
     "/etc",
@@ -332,13 +321,20 @@ test("isBroadRule rejects root and home rules in any spelling", () => {
     "*.pem",
     "**/*.py",
     "/home",
+    "~",
+    "~/",
+    "~/**",
+    "${HOME}",
+    "$HOME/*",
+    homedir(),
   ]) {
-    assert.equal(isBroadRule(rule, cwd), false, rule);
+    assert.equal(isRootRule(rule, cwd), false, rule);
   }
-  // "." is broad when the working directory is the home directory itself.
-  assert.equal(isBroadRule(".", homedir()), true);
-  assert.equal(isBroadPath("/", cwd), true);
-  assert.equal(isBroadPath(join(homedir(), "x"), cwd), false);
+  // "." when the working directory is home is just the working directory.
+  assert.equal(isRootRule(".", homedir()), false);
+  assert.equal(isRootRule(".", "/"), true);
+  assert.equal(isRootPath("/", cwd), true);
+  assert.equal(isRootPath(homedir(), cwd), false);
 });
 
 test("expandCommandToken expands $VAR and ${VAR}, returning null for unset variables", () => {

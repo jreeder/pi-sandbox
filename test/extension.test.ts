@@ -181,7 +181,7 @@ test(
       }
     };
     const notAllowed = /not in allowRead/;
-    const broad = /cannot be granted while the sandbox is enabled/;
+    const root = /cannot be granted while the sandbox is enabled/;
 
     // Interpreter heredocs: operators, comments and regexes are not paths.
     assert.equal(
@@ -196,8 +196,9 @@ test(
     // Code written to a file is data.
     assert.equal(await run(`cat > x.py <<'EOF'\nos.listdir("/")\nEOF`), undefined);
     // Root is never grantable when it is certainly a path.
-    assert.match((await run("find / -name x")).reason, broad);
-    assert.match((await run("ls ~")).reason, broad);
+    assert.match((await run("find / -name x")).reason, root);
+    // Home is an ordinary path: outside the allow-list it prompts.
+    assert.match((await run("ls ~")).reason, notAllowed);
     // Known tools prompt for paths outside the allow-list.
     assert.match((await run(`cat ${secret}`)).reason, notAllowed);
     // Unknown commands: only words naming something that exists prompt.
@@ -211,7 +212,7 @@ test(
 );
 
 test(
-  "read/write tools refuse / and the home directory instead of prompting",
+  "read/write tools refuse / but treat the home directory as an ordinary path",
   { skip: noSandbox, timeout: 15_000 },
   async (t) => {
     const { root } = setup(t, { filesystem: { allowRead: [], allowWrite: [] } });
@@ -220,11 +221,35 @@ test(
     await current.start();
     for (const result of [
       await current.toolCall("read", { path: "/" }),
-      await current.toolCall("read", { path: "~" }),
       await current.toolCall("write", { path: "/", content: "x" }),
     ]) {
       assert.equal(result?.block, true);
       assert.match(result.reason, /cannot be granted while the sandbox is enabled/);
     }
+    // Home prompts (aborted here, as there is no UI) instead of being refused.
+    const home = await current.toolCall("read", { path: "~" });
+    assert.equal(home?.block, true);
+    assert.match(home.reason, /read access denied/);
+    assert.doesNotMatch(home.reason, /cannot be granted/);
+  },
+);
+
+test(
+  "the home directory is usable when it is the working directory",
+  { skip: noSandbox, timeout: 15_000 },
+  async (t) => {
+    const { root } = setup(t, { filesystem: { allowRead: ["."], allowWrite: ["."] } });
+    const originalHome = process.env.HOME;
+    process.env.HOME = root;
+    t.after(() => {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    });
+    const current = session(root);
+    t.after(() => current.shutdown());
+    await current.start();
+    assert.equal(await current.toolCall("read", { path: "~" }), undefined);
+    assert.equal(await current.toolCall("read", { path: join(root, "notes.txt") }), undefined);
+    assert.equal(await current.toolCall("bash", { command: "ls ~ && cat ~/notes.txt" }), undefined);
   },
 );

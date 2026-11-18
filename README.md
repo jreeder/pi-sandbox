@@ -63,13 +63,13 @@ pi install git:github.com/jreeder/pi-sandbox
   `printf`, `expr` and `test`. A glob contributes its static directory
   (`cat /etc/*.conf` checks `/etc`). Standard devices (`/dev/null`, ...) never
   prompt.
-- **`/` and the home directory can never be granted while the sandbox is
-  enabled.** Permission prompts, `/sandbox-allow` and `sandbox_request_access`
-  reject rules that cover the filesystem root or the home directory itself
-  (`/`, `/**`, `~`, `~/**`, `$HOME`, or `.` when the working directory is
-  home). A bash command that certainly reads one of them is blocked; a
-  low-confidence `/` (e.g. `a / b`) is ignored. Add such a rule to the config
-  file by hand if you really need it.
+- **The filesystem root can never be granted while the sandbox is enabled.**
+  Permission prompts, `/sandbox-allow` and `sandbox_request_access` reject
+  rules that cover `/` (`/`, `//`, `/*`, `/**`). A bash command that certainly
+  reads `/` (`find /`) is blocked; a low-confidence `/` (e.g. `a / b`) is
+  ignored. Add `/` to the config file by hand if you really need it. The home
+  directory is an ordinary path: it is usable when it is the working
+  directory, and can be granted from a prompt or requested like any other.
 - **Relative patterns use gitignore semantics.** In `allowRead`, `denyRead`,
   `allowWrite` and `denyWrite`, an entry without a leading `/` or `~` (e.g.
   `.env`, `*.pem`, `Library`) is matched relative to the session working
@@ -216,8 +216,8 @@ Note below that the order of precedence for filesystem read and write are opposi
 
 | Level | Behaviour |
 |-------|-----------|
-| `strict` | Every read outside `allowRead`/`allowWrite` prompts, including low-confidence words that don't exist; a low-confidence `/` or home directory blocks |
-| `tools` (default) | High-confidence reads prompt; low-confidence words prompt only if they exist on disk; low-confidence `/` and home are ignored |
+| `strict` | Every read outside `allowRead`/`allowWrite` prompts, including low-confidence words that don't exist; a low-confidence `/` blocks |
+| `tools` (default) | High-confidence reads prompt; low-confidence words prompt only if they exist on disk; a low-confidence `/` is ignored |
 | `off` | No pre-check; the OS sandbox alone enforces the policy (credential `deny` files are still unreadable at the OS level) |
 
 Filesystem patterns may reference environment variables with `${VAR}` syntax
@@ -298,7 +298,7 @@ consistently.
 | Path read by a bash command, not in `allowRead` or `allowWrite` | Prompted before the command runs (subject to `bashPathCheck`); granting adds to `allowRead` |
 | Path written by a bash command, not in `allowWrite` | Not prompted; blocked by the OS sandbox |
 | Path in `denyWrite` referenced by a bash command | Hard-blocked before the command runs, no prompt |
-| `/` or the home directory | Never grantable from a prompt; read/write/edit and certain bash references are hard-blocked unless configured manually |
+| `/` (filesystem root) | Never grantable from a prompt; read/write/edit and certain bash references are hard-blocked unless configured manually |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
 
 Bash filesystem errors do not identify whether a read, write, or execution was

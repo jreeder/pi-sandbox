@@ -23,9 +23,9 @@ import {
 } from "./config.ts";
 import {
   allowsAllDomains,
-  BROAD_RULE_MESSAGE,
+  ROOT_RULE_MESSAGE,
   domainIsAllowed,
-  isBroadRule,
+  isRootRule,
   matchesPattern,
 } from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
@@ -482,9 +482,9 @@ const validRule = (value: string, matches: boolean, target: string): string | nu
   return matches ? null : `Rule must match the blocked ${target}.`;
 };
 
-/** Path rules additionally may never cover `/` or the home directory. */
+/** Path rules additionally may never cover the filesystem root. */
 const validPathRule = (value: string, path: string, cwd: string): string | null => {
-  if (value.length > 0 && isBroadRule(value, cwd)) return BROAD_RULE_MESSAGE;
+  if (value.length > 0 && isRootRule(value, cwd)) return ROOT_RULE_MESSAGE;
   return validRule(value, matchesPattern(path, [value], cwd), `path "${path}"`);
 };
 

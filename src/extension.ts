@@ -17,7 +17,7 @@ import {
   loadConfig,
 } from "./config.ts";
 import {
-  BROAD_RULE_MESSAGE,
+  ROOT_RULE_MESSAGE,
   canonicalizePath,
   credentialFilePaths,
   decideBashCandidate,
@@ -25,8 +25,8 @@ import {
   domainIsAllowed,
   expandCommandToken,
   extractDomainsFromCommand,
-  isBroadPath,
-  isBroadRule,
+  isRootPath,
+  isRootRule,
   matchesPattern,
   resolveWritePermission,
 } from "./policy.ts";
@@ -226,7 +226,7 @@ export default function (pi: ExtensionAPI) {
     signal?: AbortSignal;
   }) {
     const config = loadConfig(ctx.cwd, projectTrusted);
-    if (kind !== "domain" && isBroadPath(target, ctx.cwd)) throw new Error(BROAD_RULE_MESSAGE);
+    if (kind !== "domain" && isRootPath(target, ctx.cwd)) throw new Error(ROOT_RULE_MESSAGE);
     const configKey =
       kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
     const title = `Add ${target} to ${configKey}?`;
@@ -237,7 +237,7 @@ export default function (pi: ExtensionAPI) {
       target,
       (value) => {
         if (!value) return "Rule cannot be empty.";
-        if (kind !== "domain" && isBroadRule(value, ctx.cwd)) return BROAD_RULE_MESSAGE;
+        if (kind !== "domain" && isRootRule(value, ctx.cwd)) return ROOT_RULE_MESSAGE;
         const matches =
           kind === "domain"
             ? domainIsAllowed(target, [value])
@@ -499,11 +499,11 @@ export default function (pi: ExtensionAPI) {
               `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
           };
         }
-        if (decision === "broad") {
+        if (decision === "root") {
           return {
             block: true,
             reason:
-              `Sandbox: the command reads "${path}" (${candidate.source}). ${BROAD_RULE_MESSAGE}\n` +
+              `Sandbox: the command reads "${path}" (${candidate.source}). ${ROOT_RULE_MESSAGE}\n` +
               `  ${projectPath}\n  ${globalPath}`,
           };
         }
@@ -531,10 +531,10 @@ export default function (pi: ExtensionAPI) {
         return credentialBlock(path);
       }
       if (!matchesPattern(path, effectiveReadPaths(ctx.cwd), ctx.cwd)) {
-        if (isBroadPath(path, ctx.cwd)) {
+        if (isRootPath(path, ctx.cwd)) {
           return {
             block: true,
-            reason: `Sandbox: read access denied for "${path}". ${BROAD_RULE_MESSAGE}`,
+            reason: `Sandbox: read access denied for "${path}". ${ROOT_RULE_MESSAGE}`,
           };
         }
         const choice = await promptReadBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
@@ -553,12 +553,12 @@ export default function (pi: ExtensionAPI) {
       }
       const denyWrite = config.filesystem?.denyWrite ?? [];
       if (
-        isBroadPath(path, ctx.cwd) &&
+        isRootPath(path, ctx.cwd) &&
         decideWritePolicy(path, effectiveWritePaths(ctx.cwd), denyWrite, ctx.cwd) === "prompt"
       ) {
         return {
           block: true,
-          reason: `Sandbox: write access denied for "${path}". ${BROAD_RULE_MESSAGE}`,
+          reason: `Sandbox: write access denied for "${path}". ${ROOT_RULE_MESSAGE}`,
         };
       }
       const writePermission = await resolveWritePermission({

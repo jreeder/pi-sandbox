@@ -222,28 +222,28 @@ export function matchesPattern(
 }
 
 // ---------------------------------------------------------------------------
-// Root and home directory guard
+// Filesystem root guard
 
-export const BROAD_RULE_MESSAGE =
-  "Access to / or your home directory cannot be granted while the sandbox is enabled. " +
+export const ROOT_RULE_MESSAGE =
+  "Access to the filesystem root (/) cannot be granted while the sandbox is enabled. " +
   "If you really need it, add it to the sandbox config file manually.";
 
-/** True when `path` is the filesystem root or the user's home directory itself. */
-export function isBroadPath(path: string, baseCwd: string = process.cwd()): boolean {
-  const canonical = canonicalizePath(path, baseCwd);
-  return canonical === "/" || canonical === canonicalizePath(homedir());
+/** True when `path` is the filesystem root. */
+export function isRootPath(path: string, baseCwd: string = process.cwd()): boolean {
+  return canonicalizePath(path, baseCwd) === "/";
 }
 
 /**
- * True when an allow rule would cover the whole filesystem or the whole home
- * directory: `/`, `~`, `$HOME`, or those followed only by globs (`/**`, `~/*`).
+ * True when an allow rule would cover the whole filesystem: `/`, or `/`
+ * followed only by globs (`/*`, `/**`). Rules for the home directory are
+ * ordinary rules and may be granted.
  */
-export function isBroadRule(rule: string, baseCwd: string = process.cwd()): boolean {
+export function isRootRule(rule: string, baseCwd: string = process.cwd()): boolean {
   const expanded = expandCommandToken(expandEnvVars(rule.trim())) ?? rule.trim();
   const absolute = expanded.startsWith("/");
   let base = expanded.replace(/(?:\/*\*+)+\/*$/, "").replace(/\/+$/, "");
   if (base === "") base = absolute ? "/" : ".";
-  return isBroadPath(base, baseCwd);
+  return isRootPath(base, baseCwd);
 }
 
 // ---------------------------------------------------------------------------
@@ -259,7 +259,7 @@ export function isBroadRule(rule: string, baseCwd: string = process.cwd()): bool
 export type BashPathCheck = "strict" | "tools" | "off";
 export const BASH_PATH_CHECK_LEVELS: readonly BashPathCheck[] = ["strict", "tools", "off"];
 
-export type BashCandidateDecision = "allow" | "prompt" | "deny" | "credential" | "broad";
+export type BashCandidateDecision = "allow" | "prompt" | "deny" | "credential" | "root";
 
 /** Device files that are always safe to reference (`2>/dev/null`). */
 const SAFE_DEVICE = /^\/dev\/(?:null|zero|random|urandom|full|stdin|stdout|stderr|tty|fd\/\d+)$/;
@@ -269,10 +269,10 @@ const SAFE_DEVICE = /^\/dev\/(?:null|zero|random|urandom|full|stdin|stdout|stder
  *
  * Credential files and `denyWrite` matches hard-block at every confidence.
  * Writes are otherwise left to the OS sandbox, whose `allowWrite` is already an
- * allow-list. Reads outside the read allow-list prompt, except that `/` and the
- * home directory are never grantable (blocked when certain, ignored when the
- * word was only path-shaped) and, in `tools` mode, low-confidence words only
- * prompt when they name something that exists.
+ * allow-list. Reads outside the read allow-list prompt, except that `/` is
+ * never grantable (blocked when certain, ignored when the word was only
+ * path-shaped) and, in `tools` mode, low-confidence words only prompt when
+ * they name something that exists.
  */
 export function decideBashCandidate(
   candidate: { path: string; access: "read" | "write"; confidence: "high" | "low" },
@@ -297,7 +297,7 @@ export function decideBashCandidate(
   if (candidate.access === "write") return "allow";
   if (matchesPattern(canonical, readPaths, cwd)) return "allow";
   const certain = mode === "strict" || candidate.confidence === "high";
-  if (isBroadPath(canonical, cwd)) return certain ? "broad" : "allow";
+  if (isRootPath(canonical, cwd)) return certain ? "root" : "allow";
   if (certain) return "prompt";
   return exists(canonical) ? "prompt" : "allow";
 }
