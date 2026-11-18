@@ -15,7 +15,7 @@ automatically granting permissions or retrying the command.
 ## About this fork
 
 This is a fork of [carderne/pi-sandbox](https://github.com/carderne/pi-sandbox)
-that tracks upstream releases (currently synced to upstream 0.7.2) and adds
+that tracks upstream releases (currently synced to upstream 0.8.2) and adds
 stricter filesystem policy checks on top. The OS-level sandbox and runtime
 configuration are unchanged from upstream; the differences are all in the
 extension's own policy layer.
@@ -67,15 +67,14 @@ pi install git:github.com/jreeder/pi-sandbox
   is in `allowRead`, and the read/write/edit tools and the bash pre-check
   hard-block them with no prompt. The tools also hard-block every other
   `credentials.files` entry, including `mode: "mask"` ones: they run outside the
-  OS sandbox, so they would otherwise see the real contents.
+  OS sandbox, so they would otherwise see the real contents. For the same
+  reason `sandbox_request_access` refuses read/write requests for any
+  `credentials.files` entry instead of prompting.
 - **Fixes not yet in upstream:**
-  - Disabling the sandbox clears session-only grants, so re-enabling starts
-    clean, and removes `NODE_USE_ENV_PROXY` if the extension set it. The
-    variable is shared by every session in the process (e.g. subagents), so it
-    is removed only when the last sandboxed session releases it.
-  - Domain detection for bash commands catches hosts the previous pattern
-    missed: single-character labels (`https://x.com`), IP addresses,
-    `user:pass@host` URLs, and upper-case hosts.
+  - Disabling the sandbox removes `NODE_USE_ENV_PROXY` if the extension set
+    it. The variable is shared by every session in the process (e.g.
+    subagents), so it is removed only when the last sandboxed session releases
+    it.
   - The footer shows `Sandbox: disabled` when the sandbox is off (via
     `--no-sandbox`, config, a toggle, or a failed initialization) instead of
     clearing the indicator.
@@ -121,6 +120,10 @@ Install ripgrep before enabling the extension:
 | Linux (Arch) | `sudo pacman -S ripgrep` |
 | From source / other | <https://github.com/BurntSushi/ripgrep#installation> |
 
+Experimental Android/Termux support uses the Linux backend and requires `ripgrep`,
+`which`, `socat`, and a [compatible `bwrap`](https://gist.github.com/spurreiter/caa34d367b7ebbd82806a640bf41157a).
+Support depends on the device's kernel and isolation capabilities.
+
 If `which rg` succeeds in your shell but pi still reports `rg not
 found`, pi is being launched from a parent process whose `PATH` does
 not include the directory containing `rg` (common when GUI launchers
@@ -135,7 +138,7 @@ pi install npm:pi-sandbox
 
 #### Configure
 Add a config like this either to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`) or to `.pi/sandbox.json` (local).
-The local config is loaded only when Pi trusts the project. Scalar settings in the local config take precedence over global settings. The
+The local config is loaded only when Pi trusts the project. Scalar settings in the local config take precedence over global settings, except `allowProcessSignals`, which is global-only. The
 path and domain arrays from both files are combined and deduplicated, so a
 project can add permissions without repeating the global configuration. Built-in
 defaults are used for an array only when neither file configures it.
@@ -151,6 +154,7 @@ Note below that the order of precedence for filesystem read and write are opposi
 ```json
 {
   "enabled": true,
+  "enableAccessRequestTool": false, // Enable sandbox_status and sandbox_request_access
   "sandboxUserShell": false,       // Sandbox commands entered with `!`. Defaults to true
   "permissionPromptTimeoutSeconds": 600, // Defaults to 10 minutes; 0 waits indefinitely
   "allowBrowserProcess": true,     // If you want to use agent-browser or similar Chrome setup
@@ -198,6 +202,12 @@ Alt+S                            toggle sandboxing on/off for the session
 /sandbox-allow write <path>      prompt to add a path to allowWrite
 ```
 
+With `enableAccessRequestTool: true`, the agent can use `sandbox_status` to inspect
+current rules, including session-only grants, and `sandbox_request_access` to ask
+for additional access with a reason. Already-allowed requests do not prompt.
+Approvals return the actual rule and scope to the agent, including any edits you
+make in the permission prompt.
+
 ## What it does
 
 **Bash commands** are wrapped with `sandbox-exec` (macOS) or `bubblewrap`
@@ -210,8 +220,20 @@ checked against the same filesystem policy. The OS-level sandbox cannot cover
 these tools because they run directly in the Node.js process rather than in a
 subprocess.
 
-When a block is triggered, a prompt appears with four options. Permission prompts
-automatically select **Abort (keep blocked)** after 10 minutes by default. Set
+When a block is triggered, a permission widget appears above the input editor with
+four options. Concurrent requests are queued per extension instance. The widget
+accepts input while the main Pi editor (including `CustomEditor` subclasses) has
+focus; other dialogs keep their own keyboard input, and permission selection
+resumes when they close. Operation cancellation, sandbox disable, and session
+shutdown abort pending requests without granting access. The input draft is left
+untouched.
+
+Focus inspection uses Pi's `getFocusedComponent()` when available and the
+`focusedComponent` instance field on Pi 0.80. If neither is available, the request
+fails rather than intercepting input without knowing which dialog owns it.
+
+Permission prompts automatically select **Abort (keep blocked)** after 10 minutes
+by default. Set
 `permissionPromptTimeoutSeconds` to a positive number to use a different timeout,
 or set it to `0` to wait indefinitely. A timeout never grants permission.
 
@@ -278,6 +300,16 @@ implies read access; paths do not need to be repeated in `allowRead`.
 `allowUnauthenticatedSocksProxy` is enabled by default on macOS so Git-over-SSH
 works with the built-in `nc`. Domain filtering still applies, but another local process
 that discovers the temporary proxy port can use it while the sandbox is running.
+
+On macOS, set `"allowProcessSignals": true` in your **global** `sandbox.json`
+(by default `~/.pi/agent/sandbox.json`) to let commands signal processes outside
+their own sandbox, such as stopping a dev server started by an earlier command.
+It is disabled by default and ignored in project-local configuration.
+**Security warning:** this also permits signaling unrelated processes the user
+has permission to signal, including terminating or suspending other applications
+and agents. It is not limited to processes started by Pi. Linux and Windows
+behavior is unchanged. Restart Pi after changing this setting; newly wrapped
+commands get the permission, while existing processes keep their original policy.
 
 `network.disabled` turns off network sandboxing entirely: no `--unshare-net` and
 no proxy, so the sandboxed process gets direct network access via the host's

@@ -18,6 +18,7 @@ import {
   releaseNodeEnvProxy,
   resolveAllowances,
   supportsNodeEnvProxy,
+  supportsSandboxPlatform,
 } from "../src/sandbox-runtime.ts";
 
 function shellQuote(value: string): string {
@@ -74,6 +75,13 @@ function backgroundNodeCommand(cwd: string, source: string): { command: string; 
   return { command, pidPath };
 }
 
+test("Platform sandbox support", () => {
+  assert.equal(supportsSandboxPlatform("android"), true);
+  assert.equal(supportsSandboxPlatform("win32"), false);
+  assert.equal(supportsSandboxPlatform("linux"), true);
+  assert.equal(supportsSandboxPlatform("darwin"), true);
+});
+
 test("buildRuntimeConfig adds session allowances without mutating config", () => {
   const runtime = buildRuntimeConfig(DEFAULT_CONFIG, {
     domains: ["example.com"],
@@ -91,6 +99,29 @@ test("buildRuntimeConfig forwards allowAppleEvents to the runtime", () => {
   assert.equal(buildRuntimeConfig(DEFAULT_CONFIG).allowAppleEvents, undefined);
   const runtime = buildRuntimeConfig({ ...DEFAULT_CONFIG, allowAppleEvents: true });
   assert.equal(runtime.allowAppleEvents, true);
+});
+
+test("cross-sandbox process signals require global opt-in", () => {
+  const projectOptIn = { allowProcessSignals: true };
+  assert.equal(
+    buildRuntimeConfig(mergeConfigLayers(DEFAULT_CONFIG, {}, {})).allowProcessSignals,
+    false,
+  );
+  assert.equal(
+    buildRuntimeConfig(mergeConfigLayers(DEFAULT_CONFIG, {}, projectOptIn)).allowProcessSignals,
+    false,
+  );
+  assert.equal(
+    buildRuntimeConfig(
+      mergeConfigLayers(DEFAULT_CONFIG, { allowProcessSignals: false }, projectOptIn),
+    ).allowProcessSignals,
+    false,
+  );
+  assert.equal(
+    buildRuntimeConfig(mergeConfigLayers(DEFAULT_CONFIG, { allowProcessSignals: true }, {}))
+      .allowProcessSignals,
+    true,
+  );
 });
 
 function withSshAuthSock<T>(value: string | undefined, fn: () => T): T {
@@ -282,14 +313,16 @@ test("denyMandatoryCwdFiles survives the config layer merge", () => {
   assert.equal(merged.filesystem?.denyMandatoryCwdFiles, false);
 });
 
-test("buildRuntimeConfig exposes the bundled seccomp helper on Linux", () => {
-  const runtime = buildRuntimeConfig(DEFAULT_CONFIG, undefined, "linux");
+test("buildRuntimeConfig exposes the bundled seccomp helper on Linux and Android", () => {
   const runtimeEntryUrl = import.meta.resolve("@carderne/sandbox-runtime");
   const seccompPath = canonicalizePath(
     fileURLToPath(new URL("../vendor/seccomp", runtimeEntryUrl)),
   );
 
-  assert.equal(runtime.filesystem?.allowRead?.includes(seccompPath), true);
+  for (const platform of ["linux", "android"] as const) {
+    const runtime = buildRuntimeConfig(DEFAULT_CONFIG, undefined, platform);
+    assert.equal(runtime.filesystem?.allowRead?.includes(seccompPath), true);
+  }
 });
 
 test("resolveAllowances makes configured and session write paths readable", () => {
