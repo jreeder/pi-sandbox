@@ -32,18 +32,44 @@ pi install git:github.com/jreeder/pi-sandbox
 - **Bash commands are checked against the filesystem policy before they run.**
   Upstream relies on the OS sandbox for bash, and the OS sandbox only
   deny-lists reads: anything outside `denyRead` is silently readable from bash.
-  This fork scans each bash command for path-like tokens (`./`, `../`, `~/`,
-  `${VAR}/`, absolute paths, and a bare `/`) and checks them before execution:
-  - a path matching `denyWrite` hard-blocks the command;
-  - a path outside `allowRead`/`allowWrite` prompts, with the same allow-list
-    semantics as the read tool. Granting adds the path to `allowRead`.
+  This fork parses each bash command (quoting, pipelines, redirections,
+  heredocs, `$(...)`) and grades the paths it finds:
+  - **High confidence:** file arguments of known tools (`cat`, `bat`, `head`,
+    `grep`/`rg`, `sed`, `awk`, `jq`, `find`, `ls`, `cp`, `mv`, `tar`, `curl -o`,
+    ... — patterns and scripts such as `sed`'s first argument are skipped),
+    redirection targets, interpreter script files, and string literals passed
+    to file IO calls (`open(...)`, `File.read`, `fs.readFileSync`, ...) in
+    Python, Ruby and JavaScript code given via heredoc, here-string, `-c` or
+    `-e`. `bash -c`, shell heredocs, `eval` and `find -exec` are followed.
+  - **Low confidence:** path-shaped words (`/x`, `./x`, `~/x`, `$VAR/x`) passed
+    to commands not in the tool table.
 
-  `$VAR`/`${VAR}` in tokens are expanded from the environment; tokens that
-  reference an unset variable are skipped and left to the OS sandbox. The scan
-  is best-effort: bare names (`cat .env`) and paths built at runtime are not
-  detected. Expect prompts for system paths a command merely mentions
-  (`/usr/bin/...`, `/dev/null`); pre-add them to `allowRead` or grant a broad
-  rule once.
+  Heredocs fed to anything other than an interpreter or shell
+  (`cat > script.py <<EOF`) are treated as data and not scanned, so operators,
+  comments and regex literals in code no longer look like paths.
+
+  Then, controlled by `bashPathCheck`:
+  - a path in `credentials.files` (deny mode) or `denyWrite` hard-blocks;
+  - a write target is otherwise left to the OS sandbox, which enforces
+    `allowWrite` as an allow-list;
+  - a read outside `allowRead`/`allowWrite` prompts if it is high confidence,
+    or (in the default `tools` mode) if it is low confidence and exists on
+    disk. Granting adds the rule to `allowRead`.
+
+  `$VAR`/`${VAR}` are expanded from the environment; words that reference an
+  unset variable or a command substitution are skipped and left to the OS
+  sandbox, as are paths built at runtime inside interpreter code (variables,
+  f-strings, `${}` templates) and the arguments of commands like `echo`,
+  `printf`, `expr` and `test`. A glob contributes its static directory
+  (`cat /etc/*.conf` checks `/etc`). Standard devices (`/dev/null`, ...) never
+  prompt.
+- **`/` and the home directory can never be granted while the sandbox is
+  enabled.** Permission prompts, `/sandbox-allow` and `sandbox_request_access`
+  reject rules that cover the filesystem root or the home directory itself
+  (`/`, `/**`, `~`, `~/**`, `$HOME`, or `.` when the working directory is
+  home). A bash command that certainly reads one of them is blocked; a
+  low-confidence `/` (e.g. `a / b`) is ignored. Add such a rule to the config
+  file by hand if you really need it.
 - **Relative patterns use gitignore semantics.** In `allowRead`, `denyRead`,
   `allowWrite` and `denyWrite`, an entry without a leading `/` or `~` (e.g.
   `.env`, `*.pem`, `Library`) is matched relative to the session working
@@ -157,6 +183,7 @@ Note below that the order of precedence for filesystem read and write are opposi
   "enableAccessRequestTool": false, // Enable sandbox_status and sandbox_request_access
   "sandboxUserShell": false,       // Sandbox commands entered with `!`. Defaults to true
   "permissionPromptTimeoutSeconds": 600, // Defaults to 10 minutes; 0 waits indefinitely
+  "bashPathCheck": "tools",        // Bash pre-check: "strict" | "tools" (default) | "off"; see below
   "allowBrowserProcess": true,     // If you want to use agent-browser or similar Chrome setup
   "network": {
     "allowLocalBinding": true,     // ditto
@@ -184,6 +211,14 @@ Note below that the order of precedence for filesystem read and write are opposi
   }
 }
 ```
+
+`bashPathCheck` sets how bash commands are checked before they run:
+
+| Level | Behaviour |
+|-------|-----------|
+| `strict` | Every read outside `allowRead`/`allowWrite` prompts, including low-confidence words that don't exist; a low-confidence `/` or home directory blocks |
+| `tools` (default) | High-confidence reads prompt; low-confidence words prompt only if they exist on disk; low-confidence `/` and home are ignored |
+| `off` | No pre-check; the OS sandbox alone enforces the policy (credential `deny` files are still unreadable at the OS level) |
 
 Filesystem patterns may reference environment variables with `${VAR}` syntax
 (e.g. `"${HOME}/secrets"`) and a leading `~` is expanded to the home
@@ -260,8 +295,10 @@ consistently.
 | Path not in `allowWrite` | Prompted (write/edit tools) |
 | Path in `denyWrite` | Hard-blocked, no prompt |
 | Path in `credentials.files` (includes Pi's `auth.json` and `mcp-oauth/`) | Hard-blocked for read/write/edit and the bash pre-check, no prompt; `deny` entries are also unreadable from bash at the OS level |
-| Path referenced by a bash command not in `allowRead` or `allowWrite` | Prompted before the command runs; granting adds to `allowRead` |
+| Path read by a bash command, not in `allowRead` or `allowWrite` | Prompted before the command runs (subject to `bashPathCheck`); granting adds to `allowRead` |
+| Path written by a bash command, not in `allowWrite` | Not prompted; blocked by the OS sandbox |
 | Path in `denyWrite` referenced by a bash command | Hard-blocked before the command runs, no prompt |
+| `/` or the home directory | Never grantable from a prompt; read/write/edit and certain bash references are hard-blocked unless configured manually |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
 
 Bash filesystem errors do not identify whether a read, write, or execution was

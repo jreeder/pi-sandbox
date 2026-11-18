@@ -16,25 +16,6 @@ export function decideWritePolicy(
 }
 
 /**
- * Decide how a candidate path referenced by a bash command is handled before
- * the command runs: `denyWrite` matches are hard-blocked; anything outside the
- * effective read paths (allowRead + allowWrite + session grants) prompts, the
- * same allow-list semantics the read tool uses. The OS sandbox cannot provide
- * this — it only deny-lists reads, so paths outside `denyRead` would otherwise
- * be silently readable from bash.
- */
-export function decideBashPathPolicy(
-  path: string,
-  readPaths: string[],
-  denyWrite: string[],
-  cwd: string,
-): "deny" | "prompt" | "allow" {
-  if (denyWrite.length > 0 && matchesPattern(path, denyWrite, cwd)) return "deny";
-  if (!matchesPattern(path, readPaths, cwd)) return "prompt";
-  return "allow";
-}
-
-/**
  * Paths declared in `credentials.files`. The read/write/edit tools run in
  * pi's own process, outside the OS sandbox, so they would see a masked file's
  * real contents: they block every declared path. Bash runs inside the sandbox,
@@ -115,37 +96,6 @@ export function extractDomainsFromCommand(command: string): string[] {
     if (/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(host)) domains.add(host);
   }
   return [...domains];
-}
-
-/**
- * Extract candidate file paths from a bash command string for pre-execution
- * policy checks. Only tokens that already look like paths are matched — a
- * leading ./ ../ ~/ ${VAR}/ or /, including a bare `/` (or `//`) token so
- * root traversals like `find /` are caught — while bare names like `cat .env`
- * are left to the OS sandbox layer. False positives cost an extra prompt
- * (paths outside allowRead) or an unnecessary block (denyWrite); false
- * negatives mean a sensitive file is only caught post-execution by the OS
- * sandbox.
- */
-export function extractPathsFromCommand(command: string): string[] {
-  // Strip comments and quoted strings to reduce noise, then tokenize.
-  const stripped = command
-    .replace(/#[^\n]*/g, "") // strip # comments
-    .replace(/'[^']*'/g, " ") // strip single-quoted strings
-    .replace(/"[^"]*"/g, " "); // strip double-quoted strings (rough)
-
-  // Path-like token alternatives: relative/home/env-var prefixes, absolute
-  // paths (`/+` tolerates `//etc`-style doubled slashes; `[\w.]` admits
-  // hidden files like /.dockerenv), and a token of only slashes (`find /`).
-  const re =
-    /(?:^|[\s=|(;&`])((?:~\/|\.{1,2}\/|\$\{?\w+\}?\/|\/+[\w.])[^\s;|&'"<>]*|\/+(?![^\s;|&'"<>]))/g;
-  const paths = new Set<string>();
-  let match: RegExpExecArray | null;
-  while ((match = re.exec(stripped)) !== null) {
-    const path = match[1]!.replace(/[);,]+$/, ""); // trim trailing punctuation
-    if (path) paths.add(path);
-  }
-  return [...paths];
 }
 
 export function domainMatchesPattern(domain: string, pattern: string): boolean {
@@ -269,4 +219,85 @@ export function matchesPattern(
   }
 
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Root and home directory guard
+
+export const BROAD_RULE_MESSAGE =
+  "Access to / or your home directory cannot be granted while the sandbox is enabled. " +
+  "If you really need it, add it to the sandbox config file manually.";
+
+/** True when `path` is the filesystem root or the user's home directory itself. */
+export function isBroadPath(path: string, baseCwd: string = process.cwd()): boolean {
+  const canonical = canonicalizePath(path, baseCwd);
+  return canonical === "/" || canonical === canonicalizePath(homedir());
+}
+
+/**
+ * True when an allow rule would cover the whole filesystem or the whole home
+ * directory: `/`, `~`, `$HOME`, or those followed only by globs (`/**`, `~/*`).
+ */
+export function isBroadRule(rule: string, baseCwd: string = process.cwd()): boolean {
+  const expanded = expandCommandToken(expandEnvVars(rule.trim())) ?? rule.trim();
+  const absolute = expanded.startsWith("/");
+  let base = expanded.replace(/(?:\/*\*+)+\/*$/, "").replace(/\/+$/, "");
+  if (base === "") base = absolute ? "/" : ".";
+  return isBroadPath(base, baseCwd);
+}
+
+// ---------------------------------------------------------------------------
+// Bash pre-check decisions
+
+/**
+ * How strictly bash commands are checked before they run:
+ * - `strict`: every candidate path outside the read allow-list prompts.
+ * - `tools` (default): paths in known file positions prompt; other path-shaped
+ *   words prompt only when they exist on disk.
+ * - `off`: no pre-check; the OS sandbox alone enforces policy.
+ */
+export type BashPathCheck = "strict" | "tools" | "off";
+export const BASH_PATH_CHECK_LEVELS: readonly BashPathCheck[] = ["strict", "tools", "off"];
+
+export type BashCandidateDecision = "allow" | "prompt" | "deny" | "credential" | "broad";
+
+/** Device files that are always safe to reference (`2>/dev/null`). */
+const SAFE_DEVICE = /^\/dev\/(?:null|zero|random|urandom|full|stdin|stdout|stderr|tty|fd\/\d+)$/;
+
+/**
+ * Decide how one path referenced by a bash command is handled before it runs.
+ *
+ * Credential files and `denyWrite` matches hard-block at every confidence.
+ * Writes are otherwise left to the OS sandbox, whose `allowWrite` is already an
+ * allow-list. Reads outside the read allow-list prompt, except that `/` and the
+ * home directory are never grantable (blocked when certain, ignored when the
+ * word was only path-shaped) and, in `tools` mode, low-confidence words only
+ * prompt when they name something that exists.
+ */
+export function decideBashCandidate(
+  candidate: { path: string; access: "read" | "write"; confidence: "high" | "low" },
+  options: {
+    mode: BashPathCheck;
+    readPaths: string[];
+    denyWrite: string[];
+    credentialDeny: string[];
+    cwd: string;
+    exists?: (path: string) => boolean;
+  },
+): BashCandidateDecision {
+  const { mode, readPaths, denyWrite, credentialDeny, cwd } = options;
+  const exists = options.exists ?? existsSync;
+  if (mode === "off") return "allow";
+  const canonical = canonicalizePath(candidate.path, cwd);
+  if (SAFE_DEVICE.test(canonical)) return "allow";
+  if (credentialDeny.length > 0 && matchesPattern(canonical, credentialDeny, cwd)) {
+    return "credential";
+  }
+  if (denyWrite.length > 0 && matchesPattern(canonical, denyWrite, cwd)) return "deny";
+  if (candidate.access === "write") return "allow";
+  if (matchesPattern(canonical, readPaths, cwd)) return "allow";
+  const certain = mode === "strict" || candidate.confidence === "high";
+  if (isBroadPath(canonical, cwd)) return certain ? "broad" : "allow";
+  if (certain) return "prompt";
+  return exists(canonical) ? "prompt" : "allow";
 }

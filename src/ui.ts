@@ -21,7 +21,13 @@ import {
   getConfigPaths,
   type SandboxConfig,
 } from "./config.ts";
-import { allowsAllDomains, domainIsAllowed, matchesPattern } from "./policy.ts";
+import {
+  allowsAllDomains,
+  BROAD_RULE_MESSAGE,
+  domainIsAllowed,
+  isBroadRule,
+  matchesPattern,
+} from "./policy.ts";
 import { type SessionAllowances } from "./sandbox-runtime.ts";
 
 export type PermissionChoice = "abort" | "session" | "project" | "global";
@@ -476,6 +482,12 @@ const validRule = (value: string, matches: boolean, target: string): string | nu
   return matches ? null : `Rule must match the blocked ${target}.`;
 };
 
+/** Path rules additionally may never cover `/` or the home directory. */
+const validPathRule = (value: string, path: string, cwd: string): string | null => {
+  if (value.length > 0 && isBroadRule(value, cwd)) return BROAD_RULE_MESSAGE;
+  return validRule(value, matchesPattern(path, [value], cwd), `path "${path}"`);
+};
+
 export function promptDomainBlock(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -503,7 +515,7 @@ export function promptReadBlock(
     ctx,
     `📖 Read blocked: "${path}" is not in allowRead`,
     path,
-    (value) => validRule(value, matchesPattern(path, [value], ctx.cwd), `path "${path}"`),
+    (value) => validPathRule(value, path, ctx.cwd),
     timeoutSeconds,
   );
 }
@@ -519,7 +531,7 @@ export function promptWriteBlock(
     ctx,
     `📝 Write blocked: "${path}" is not in allowWrite`,
     path,
-    (value) => validRule(value, matchesPattern(path, [value], ctx.cwd), `path "${path}"`),
+    (value) => validPathRule(value, path, ctx.cwd),
     timeoutSeconds,
   );
 }

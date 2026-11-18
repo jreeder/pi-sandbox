@@ -155,3 +155,76 @@ test(
     assert.match(current.statuses.at(-1)!, /^🔒 Sandbox:/);
   },
 );
+
+test(
+  "bash pre-check ignores code noise, gates unknown words on existence and never grants /",
+  { skip: noSandbox, timeout: 20_000 },
+  async (t) => {
+    const outside = mkdtempSync(join(tmpdir(), "pi-sandbox-outside-"));
+    t.after(() => rmSync(outside, { recursive: true, force: true }));
+    const secret = join(outside, "secret.txt");
+    writeFileSync(secret, "x");
+    const missing = join(outside, "missing", "file");
+
+    const run = async (command: string, bashPathCheck?: string) => {
+      const { root } = setup(t);
+      writeFileSync(
+        join(process.env.PI_CODING_AGENT_DIR!, "sandbox.json"),
+        JSON.stringify({ bashPathCheck, filesystem: { allowRead: [root], allowWrite: [root] } }),
+      );
+      const current = session(root);
+      await current.start();
+      try {
+        return await current.toolCall("bash", { command });
+      } finally {
+        await current.shutdown();
+      }
+    };
+    const notAllowed = /not in allowRead/;
+    const broad = /cannot be granted while the sandbox is enabled/;
+
+    // Interpreter heredocs: operators, comments and regexes are not paths.
+    assert.equal(
+      await run(`python3 - <<'EOF'\nx = 1 // 2  # /etc\nre.sub(r"/a/", "", s)\nEOF`),
+      undefined,
+    );
+    // ...but literal IO calls are, at high confidence.
+    assert.match(
+      (await run(`python3 - <<'EOF'\nopen("${secret}").read()\nEOF`)).reason,
+      notAllowed,
+    );
+    // Code written to a file is data.
+    assert.equal(await run(`cat > x.py <<'EOF'\nos.listdir("/")\nEOF`), undefined);
+    // Root is never grantable when it is certainly a path.
+    assert.match((await run("find / -name x")).reason, broad);
+    assert.match((await run("ls ~")).reason, broad);
+    // Known tools prompt for paths outside the allow-list.
+    assert.match((await run(`cat ${secret}`)).reason, notAllowed);
+    // Unknown commands: only words naming something that exists prompt.
+    assert.match((await run(`some-tool ${secret}`)).reason, notAllowed);
+    assert.equal(await run(`some-tool ${missing}`), undefined);
+    assert.equal(await run("expr 4 / 2"), undefined);
+    // Levels.
+    assert.match((await run(`some-tool ${missing}`, "strict")).reason, notAllowed);
+    assert.equal(await run(`cat ${secret}`, "off"), undefined);
+  },
+);
+
+test(
+  "read/write tools refuse / and the home directory instead of prompting",
+  { skip: noSandbox, timeout: 15_000 },
+  async (t) => {
+    const { root } = setup(t, { filesystem: { allowRead: [], allowWrite: [] } });
+    const current = session(root);
+    t.after(() => current.shutdown());
+    await current.start();
+    for (const result of [
+      await current.toolCall("read", { path: "/" }),
+      await current.toolCall("read", { path: "~" }),
+      await current.toolCall("write", { path: "/", content: "x" }),
+    ]) {
+      assert.equal(result?.block, true);
+      assert.match(result.reason, /cannot be granted while the sandbox is enabled/);
+    }
+  },
+);

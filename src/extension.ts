@@ -8,6 +8,7 @@ import {
 import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
+import { extractBashPathCandidates } from "./bash-paths.ts";
 import {
   addDomainToConfig,
   addReadPathToConfig,
@@ -16,13 +17,16 @@ import {
   loadConfig,
 } from "./config.ts";
 import {
+  BROAD_RULE_MESSAGE,
   canonicalizePath,
   credentialFilePaths,
-  decideBashPathPolicy,
+  decideBashCandidate,
+  decideWritePolicy,
   domainIsAllowed,
   expandCommandToken,
   extractDomainsFromCommand,
-  extractPathsFromCommand,
+  isBroadPath,
+  isBroadRule,
   matchesPattern,
   resolveWritePermission,
 } from "./policy.ts";
@@ -222,6 +226,7 @@ export default function (pi: ExtensionAPI) {
     signal?: AbortSignal;
   }) {
     const config = loadConfig(ctx.cwd, projectTrusted);
+    if (kind !== "domain" && isBroadPath(target, ctx.cwd)) throw new Error(BROAD_RULE_MESSAGE);
     const configKey =
       kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
     const title = `Add ${target} to ${configKey}?`;
@@ -232,6 +237,7 @@ export default function (pi: ExtensionAPI) {
       target,
       (value) => {
         if (!value) return "Rule cannot be empty.";
+        if (kind !== "domain" && isBroadRule(value, ctx.cwd)) return BROAD_RULE_MESSAGE;
         const matches =
           kind === "domain"
             ? domainIsAllowed(target, [value])
@@ -463,41 +469,55 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // Path pre-check: candidate paths in the command are checked before it
-      // runs. denyWrite matches are hard-blocked; anything outside the
-      // effective read paths prompts, mirroring the read tool's allow-list
-      // semantics. The OS sandbox can't do this — it only deny-lists reads.
+      // Path pre-check: paths the command will touch are checked before it runs
+      // (see decideBashCandidate). The OS sandbox can't do this for reads — it
+      // only deny-lists them.
+      const mode = config.bashPathCheck ?? "tools";
       const denyWrite = config.filesystem?.denyWrite ?? [];
       const credentialDeny = credentialFilePaths(config.credentials, true);
-      for (const token of extractPathsFromCommand(event.input.command)) {
-        const candidate = expandCommandToken(token);
-        if (candidate === null) continue;
-        if (matchesPattern(candidate, credentialDeny, ctx.cwd)) return credentialBlock(candidate);
-        const policy = decideBashPathPolicy(
-          candidate,
-          effectiveReadPaths(ctx.cwd),
-          denyWrite,
-          ctx.cwd,
+      const candidates = mode === "off" ? [] : extractBashPathCandidates(event.input.command);
+      for (const candidate of candidates) {
+        const expanded = expandCommandToken(candidate.path);
+        if (expanded === null) continue;
+        const path = canonicalizePath(expanded, ctx.cwd);
+        const decision = decideBashCandidate(
+          { ...candidate, path },
+          {
+            mode,
+            readPaths: effectiveReadPaths(ctx.cwd),
+            denyWrite,
+            credentialDeny,
+            cwd: ctx.cwd,
+          },
         );
-        if (policy === "deny") {
+        if (decision === "credential") return credentialBlock(path);
+        if (decision === "deny") {
           return {
             block: true,
             reason:
-              `Sandbox: "${candidate}" matches denyWrite. ` +
+              `Sandbox: "${path}" matches denyWrite. ` +
               `To change this, edit denyWrite in:\n  ${projectPath}\n  ${globalPath}`,
           };
         }
-        if (policy === "prompt") {
+        if (decision === "broad") {
+          return {
+            block: true,
+            reason:
+              `Sandbox: the command reads "${path}" (${candidate.source}). ${BROAD_RULE_MESSAGE}\n` +
+              `  ${projectPath}\n  ${globalPath}`,
+          };
+        }
+        if (decision === "prompt") {
           const choice = await promptReadBlock(
             pi,
             ctx,
-            candidate,
+            path,
             config.permissionPromptTimeoutSeconds,
           );
           if (choice.action === "abort") {
             return {
               block: true,
-              reason: `Sandbox: read access denied for "${candidate}" (not in allowRead).`,
+              reason: `Sandbox: read access denied for "${path}" (not in allowRead).`,
             };
           }
           await applyChoice(choice.action, "read", choice.value, ctx.cwd);
@@ -511,6 +531,12 @@ export default function (pi: ExtensionAPI) {
         return credentialBlock(path);
       }
       if (!matchesPattern(path, effectiveReadPaths(ctx.cwd), ctx.cwd)) {
+        if (isBroadPath(path, ctx.cwd)) {
+          return {
+            block: true,
+            reason: `Sandbox: read access denied for "${path}". ${BROAD_RULE_MESSAGE}`,
+          };
+        }
         const choice = await promptReadBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds);
         if (choice.action === "abort") {
           return { block: true, reason: `Sandbox: read access denied for "${path}"` };
@@ -525,10 +551,20 @@ export default function (pi: ExtensionAPI) {
       if (matchesPattern(path, credentialFilePaths(config.credentials), ctx.cwd)) {
         return credentialBlock(path);
       }
+      const denyWrite = config.filesystem?.denyWrite ?? [];
+      if (
+        isBroadPath(path, ctx.cwd) &&
+        decideWritePolicy(path, effectiveWritePaths(ctx.cwd), denyWrite, ctx.cwd) === "prompt"
+      ) {
+        return {
+          block: true,
+          reason: `Sandbox: write access denied for "${path}". ${BROAD_RULE_MESSAGE}`,
+        };
+      }
       const writePermission = await resolveWritePermission({
         path,
         allowWrite: effectiveWritePaths(ctx.cwd),
-        denyWrite: config.filesystem?.denyWrite ?? [],
+        denyWrite,
         baseCwd: ctx.cwd,
         prompt: (path) => promptWriteBlock(pi, ctx, path, config.permissionPromptTimeoutSeconds),
         saveWritePermission: (choice, value) => applyChoice(choice, "write", value, ctx.cwd),
@@ -617,7 +653,13 @@ export default function (pi: ExtensionAPI) {
       const target = kind === "domain" ? targetArg : canonicalizePath(targetArg, ctx.cwd);
       const configKey =
         kind === "domain" ? "allowedDomains" : kind === "read" ? "allowRead" : "allowWrite";
-      const choice = await requestAccess({ kind, target, ctx });
+      let choice: Awaited<ReturnType<typeof requestAccess>>;
+      try {
+        choice = await requestAccess({ kind, target, ctx });
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        return;
+      }
       if (choice.action === "abort") {
         ctx.ui.notify("Allow cancelled", "info");
         return;
