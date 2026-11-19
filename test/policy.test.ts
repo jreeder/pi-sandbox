@@ -9,13 +9,14 @@ import {
   allowsAllDomains,
   canonicalizePath,
   credentialFilePaths,
-  decideBashPathPolicy,
+  decideBashCandidate,
   decideWritePolicy,
   domainIsAllowed,
   expandCommandToken,
   expandEnvVars,
   extractDomainsFromCommand,
-  extractPathsFromCommand,
+  isRootPath,
+  isRootRule,
   matchesPattern,
   resolveWritePermission,
 } from "../src/policy.ts";
@@ -202,26 +203,6 @@ test("expandEnvVars expands ${VAR} references and a leading ~", () => {
   }
 });
 
-test("extractPathsFromCommand pulls plausible file paths and ignores quoted strings", () => {
-  // Bare relative names with no ./ ../ ~/ prefix are intentionally not
-  // matched — only tokens that already look like paths are considered.
-  assert.deepEqual(extractPathsFromCommand("cat .env"), []);
-  assert.deepEqual(extractPathsFromCommand("cat ./.env"), ["./.env"]);
-  assert.deepEqual(extractPathsFromCommand("cat ./config/secret.pem"), ["./config/secret.pem"]);
-  assert.deepEqual(extractPathsFromCommand("echo 'not/a/path' && cat ./real.pem"), ["./real.pem"]);
-  assert.deepEqual(extractPathsFromCommand("cat /etc/passwd"), ["/etc/passwd"]);
-});
-
-test("extractPathsFromCommand catches root traversals and slash variants", () => {
-  assert.deepEqual(extractPathsFromCommand("find / -name secrets"), ["/"]);
-  assert.deepEqual(extractPathsFromCommand("du -sh /"), ["/"]);
-  assert.deepEqual(extractPathsFromCommand("find // -type f"), ["//"]);
-  assert.deepEqual(extractPathsFromCommand("cat //etc/passwd"), ["//etc/passwd"]);
-  assert.deepEqual(extractPathsFromCommand("cat /.dockerenv"), ["/.dockerenv"]);
-  // Slashes inside URLs and mid-token are not candidates.
-  assert.deepEqual(extractPathsFromCommand("curl https://example.com/path"), []);
-});
-
 test("relative paths resolve against baseCwd, not process.cwd()", () => {
   const root = mkdtempSync(join(tmpdir(), "pi-sandbox-basecwd-"));
   const project = canonicalizePath(root);
@@ -252,25 +233,108 @@ test("canonicalizes symlinks and nonexistent descendants", () => {
   );
 });
 
-test("decideBashPathPolicy hard-blocks denyWrite and prompts outside the read allow-list", () => {
-  const cwd = mkdtempSync(join(tmpdir(), "pi-sandbox-bashpolicy-"));
-  const readPaths = [cwd, "/tmp"];
-  const denyWrite = ["*.pem", join(homedir(), ".ssh")];
+test("decideBashCandidate hard-blocks deny rules and prompts for reads outside the allow-list", () => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-bashpolicy-")));
+  const base = {
+    mode: "tools" as const,
+    readPaths: [cwd, "/tmp"],
+    denyWrite: ["*.pem", join(homedir(), ".ssh")],
+    credentialDeny: [join(cwd, "auth.json")],
+    cwd,
+    exists: () => true,
+  };
+  const read = (path: string, confidence: "high" | "low" = "high") =>
+    decideBashCandidate({ path, access: "read", confidence }, base);
 
-  assert.equal(decideBashPathPolicy(join(cwd, "src/main.ts"), readPaths, denyWrite, cwd), "allow");
-  assert.equal(decideBashPathPolicy("/tmp/scratch.txt", readPaths, denyWrite, cwd), "allow");
-  // Outside allowRead/allowWrite: prompt, even though nothing deny-lists it.
+  assert.equal(read(join(cwd, "src/main.ts")), "allow");
+  assert.equal(read("/tmp/scratch.txt"), "allow");
+  assert.equal(read(join(homedir(), ".orbstack/config")), "prompt");
+  assert.equal(read("/etc/passwd"), "prompt");
+  // denyWrite and credentials win over everything, at any confidence.
+  assert.equal(read(join(cwd, "cert.pem"), "low"), "deny");
+  assert.equal(read(join(homedir(), ".ssh/id_rsa")), "deny");
+  assert.equal(read(join(cwd, "auth.json"), "low"), "credential");
+  // Device files are always fine.
+  assert.equal(read("/dev/null"), "allow");
+  // Writes are left to the OS sandbox's allowWrite unless denied.
   assert.equal(
-    decideBashPathPolicy(join(homedir(), ".orbstack/config"), readPaths, denyWrite, cwd),
-    "prompt",
+    decideBashCandidate({ path: "/opt/out", access: "write", confidence: "high" }, base),
+    "allow",
   );
-  assert.equal(decideBashPathPolicy("/etc/passwd", readPaths, denyWrite, cwd), "prompt");
-  // denyWrite wins over everything, without a prompt.
-  assert.equal(decideBashPathPolicy(join(cwd, "cert.pem"), readPaths, denyWrite, cwd), "deny");
   assert.equal(
-    decideBashPathPolicy(join(homedir(), ".ssh/id_rsa"), readPaths, denyWrite, cwd),
+    decideBashCandidate({ path: join(cwd, "k.pem"), access: "write", confidence: "high" }, base),
     "deny",
   );
+});
+
+test("decideBashCandidate gates low-confidence words on existence and never grants /", () => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-bashpolicy-")));
+  const options = (mode: "strict" | "tools" | "off", exists: boolean) => ({
+    mode,
+    readPaths: [cwd],
+    denyWrite: [],
+    credentialDeny: [],
+    cwd,
+    exists: () => exists,
+  });
+  const decide = (
+    path: string,
+    confidence: "high" | "low",
+    mode: "strict" | "tools" | "off",
+    exists = true,
+  ) => decideBashCandidate({ path, access: "read", confidence }, options(mode, exists));
+
+  assert.equal(decide("/opt/conf", "low", "tools", true), "prompt");
+  assert.equal(decide("/opt/conf", "low", "tools", false), "allow");
+  assert.equal(decide("/opt/conf", "low", "strict", false), "prompt");
+  assert.equal(decide("/opt/conf", "high", "tools", false), "prompt");
+  assert.equal(decide("/opt/conf", "high", "off"), "allow");
+  // Root: blocked when certain, ignored when merely path-shaped.
+  assert.equal(decide("/", "high", "tools"), "root");
+  assert.equal(decide("//", "high", "tools"), "root");
+  assert.equal(decide("/", "low", "tools"), "allow");
+  assert.equal(decide("/", "low", "strict"), "root");
+  // Home is an ordinary path: it prompts like any other.
+  assert.equal(decide(homedir(), "high", "tools"), "prompt");
+  assert.equal(decide("~", "low", "tools"), "prompt");
+  // A manually configured root rule is honoured.
+  assert.equal(
+    decideBashCandidate(
+      { path: "/", access: "read", confidence: "high" },
+      { ...options("tools", true), readPaths: ["/"] },
+    ),
+    "allow",
+  );
+});
+
+test("isRootRule rejects root rules in any spelling and allows home", () => {
+  const cwd = canonicalizePath(mkdtempSync(join(tmpdir(), "pi-sandbox-broad-")));
+  for (const rule of ["/", "//", "/*", "/**", "/**/"]) {
+    assert.equal(isRootRule(rule, cwd), true, rule);
+  }
+  for (const rule of [
+    "/etc",
+    "/etc/**",
+    "~/.config",
+    "~/src/**",
+    ".",
+    "*.pem",
+    "**/*.py",
+    "/home",
+    "~",
+    "~/",
+    "~/**",
+    "${HOME}",
+    "$HOME/*",
+    homedir(),
+  ]) {
+    assert.equal(isRootRule(rule, cwd), false, rule);
+  }
+  // "." when the working directory is home is just the working directory.
+  assert.equal(isRootRule(".", homedir()), false);
+  assert.equal(isRootRule(".", "/"), true);
+  assert.equal(isRootPath("/", cwd), true);
+  assert.equal(isRootPath(homedir(), cwd), false);
 });
 
 test("expandCommandToken expands $VAR and ${VAR}, returning null for unset variables", () => {

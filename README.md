@@ -15,7 +15,7 @@ automatically granting permissions or retrying the command.
 ## About this fork
 
 This is a fork of [carderne/pi-sandbox](https://github.com/carderne/pi-sandbox)
-that tracks upstream releases (currently synced to upstream 0.7.2) and adds
+that tracks upstream releases (currently synced to upstream 0.8.2) and adds
 stricter filesystem policy checks on top. The OS-level sandbox and runtime
 configuration are unchanged from upstream; the differences are all in the
 extension's own policy layer.
@@ -32,18 +32,21 @@ pi install git:github.com/jreeder/pi-sandbox
 - **Bash commands are checked against the filesystem policy before they run.**
   Upstream relies on the OS sandbox for bash, and the OS sandbox only
   deny-lists reads: anything outside `denyRead` is silently readable from bash.
-  This fork scans each bash command for path-like tokens (`./`, `../`, `~/`,
-  `${VAR}/`, absolute paths, and a bare `/`) and checks them before execution:
-  - a path matching `denyWrite` hard-blocks the command;
-  - a path outside `allowRead`/`allowWrite` prompts, with the same allow-list
-    semantics as the read tool. Granting adds the path to `allowRead`.
-
-  `$VAR`/`${VAR}` in tokens are expanded from the environment; tokens that
-  reference an unset variable are skipped and left to the OS sandbox. The scan
-  is best-effort: bare names (`cat .env`) and paths built at runtime are not
-  detected. Expect prompts for system paths a command merely mentions
-  (`/usr/bin/...`, `/dev/null`); pre-add them to `allowRead` or grant a broad
-  rule once.
+  This fork parses each bash command, works out which paths it will read or
+  write, and checks them before the command runs: reads outside
+  `allowRead`/`allowWrite` prompt, and `denyWrite` and credential files
+  hard-block. It knows the file arguments of common CLI tools, redirections,
+  and file IO calls in inline Python, Ruby and JavaScript (heredocs, `-c`,
+  `-e`), and treats code written to a file through a heredoc as data, so
+  operators, comments and regex literals in code don't look like paths.
+  Strictness is set with `bashPathCheck`. See [Bash pre-check](#bash-pre-check).
+- **The filesystem root can never be granted while the sandbox is enabled.**
+  Permission prompts, `/sandbox-allow` and `sandbox_request_access` reject
+  rules that cover `/` (`/`, `//`, `/*`, `/**`). A bash command that certainly
+  reads `/` (`find /`) is blocked; a low-confidence `/` (e.g. `a / b`) is
+  ignored. Add `/` to the config file by hand if you really need it. The home
+  directory is an ordinary path: it is usable when it is the working
+  directory, and can be granted from a prompt or requested like any other.
 - **Relative patterns use gitignore semantics.** In `allowRead`, `denyRead`,
   `allowWrite` and `denyWrite`, an entry without a leading `/` or `~` (e.g.
   `.env`, `*.pem`, `Library`) is matched relative to the session working
@@ -67,15 +70,14 @@ pi install git:github.com/jreeder/pi-sandbox
   is in `allowRead`, and the read/write/edit tools and the bash pre-check
   hard-block them with no prompt. The tools also hard-block every other
   `credentials.files` entry, including `mode: "mask"` ones: they run outside the
-  OS sandbox, so they would otherwise see the real contents.
+  OS sandbox, so they would otherwise see the real contents. For the same
+  reason `sandbox_request_access` refuses read/write requests for any
+  `credentials.files` entry instead of prompting.
 - **Fixes not yet in upstream:**
-  - Disabling the sandbox clears session-only grants, so re-enabling starts
-    clean, and removes `NODE_USE_ENV_PROXY` if the extension set it. The
-    variable is shared by every session in the process (e.g. subagents), so it
-    is removed only when the last sandboxed session releases it.
-  - Domain detection for bash commands catches hosts the previous pattern
-    missed: single-character labels (`https://x.com`), IP addresses,
-    `user:pass@host` URLs, and upper-case hosts.
+  - Disabling the sandbox removes `NODE_USE_ENV_PROXY` if the extension set
+    it. The variable is shared by every session in the process (e.g.
+    subagents), so it is removed only when the last sandboxed session releases
+    it.
   - The footer shows `Sandbox: disabled` when the sandbox is off (via
     `--no-sandbox`, config, a toggle, or a failed initialization) instead of
     clearing the indicator.
@@ -121,6 +123,10 @@ Install ripgrep before enabling the extension:
 | Linux (Arch) | `sudo pacman -S ripgrep` |
 | From source / other | <https://github.com/BurntSushi/ripgrep#installation> |
 
+Experimental Android/Termux support uses the Linux backend and requires `ripgrep`,
+`which`, `socat`, and a [compatible `bwrap`](https://gist.github.com/spurreiter/caa34d367b7ebbd82806a640bf41157a).
+Support depends on the device's kernel and isolation capabilities.
+
 If `which rg` succeeds in your shell but pi still reports `rg not
 found`, pi is being launched from a parent process whose `PATH` does
 not include the directory containing `rg` (common when GUI launchers
@@ -135,7 +141,7 @@ pi install npm:pi-sandbox
 
 #### Configure
 Add a config like this either to Pi's global agent directory (by default, `~/.pi/agent/sandbox.json`; respects `PI_CODING_AGENT_DIR`) or to `.pi/sandbox.json` (local).
-The local config is loaded only when Pi trusts the project. Scalar settings in the local config take precedence over global settings. The
+The local config is loaded only when Pi trusts the project. Scalar settings in the local config take precedence over global settings, except `allowProcessSignals`, which is global-only. The
 path and domain arrays from both files are combined and deduplicated, so a
 project can add permissions without repeating the global configuration. Built-in
 defaults are used for an array only when neither file configures it.
@@ -151,8 +157,10 @@ Note below that the order of precedence for filesystem read and write are opposi
 ```json
 {
   "enabled": true,
+  "enableAccessRequestTool": false, // Enable sandbox_status and sandbox_request_access
   "sandboxUserShell": false,       // Sandbox commands entered with `!`. Defaults to true
   "permissionPromptTimeoutSeconds": 600, // Defaults to 10 minutes; 0 waits indefinitely
+  "bashPathCheck": "tools",        // Bash pre-check: "strict" | "tools" (default) | "off"; see below
   "allowBrowserProcess": true,     // If you want to use agent-browser or similar Chrome setup
   "network": {
     "allowLocalBinding": true,     // ditto
@@ -181,6 +189,14 @@ Note below that the order of precedence for filesystem read and write are opposi
 }
 ```
 
+`bashPathCheck` sets how bash commands are checked before they run:
+
+| Level | Behaviour |
+|-------|-----------|
+| `strict` | Every read outside `allowRead`/`allowWrite` prompts, including low-confidence words that don't exist; a low-confidence `/` blocks |
+| `tools` (default) | High-confidence reads prompt; low-confidence words prompt only if they exist on disk; a low-confidence `/` is ignored |
+| `off` | No pre-check, including the bash `denyWrite` and credential-file checks; the OS sandbox alone enforces the policy (credential `deny` files stay unreadable and `denyWrite` paths unwritable at the OS level, except glob entries on Linux) |
+
 Filesystem patterns may reference environment variables with `${VAR}` syntax
 (e.g. `"${HOME}/secrets"`) and a leading `~` is expanded to the home
 directory; both are resolved when the config is loaded.
@@ -198,6 +214,12 @@ Alt+S                            toggle sandboxing on/off for the session
 /sandbox-allow write <path>      prompt to add a path to allowWrite
 ```
 
+With `enableAccessRequestTool: true`, the agent can use `sandbox_status` to inspect
+current rules, including session-only grants, and `sandbox_request_access` to ask
+for additional access with a reason. Already-allowed requests do not prompt.
+Approvals return the actual rule and scope to the agent, including any edits you
+make in the permission prompt.
+
 ## What it does
 
 **Bash commands** are wrapped with `sandbox-exec` (macOS) or `bubblewrap`
@@ -210,8 +232,20 @@ checked against the same filesystem policy. The OS-level sandbox cannot cover
 these tools because they run directly in the Node.js process rather than in a
 subprocess.
 
-When a block is triggered, a prompt appears with four options. Permission prompts
-automatically select **Abort (keep blocked)** after 10 minutes by default. Set
+When a block is triggered, a permission widget appears above the input editor with
+four options. Concurrent requests are queued per extension instance. The widget
+accepts input while the main Pi editor (including `CustomEditor` subclasses) has
+focus; other dialogs keep their own keyboard input, and permission selection
+resumes when they close. Operation cancellation, sandbox disable, and session
+shutdown abort pending requests without granting access. The input draft is left
+untouched.
+
+Focus inspection uses Pi's `getFocusedComponent()` when available and the
+`focusedComponent` instance field on Pi 0.80. If neither is available, the request
+fails rather than intercepting input without knowing which dialog owns it.
+
+Permission prompts automatically select **Abort (keep blocked)** after 10 minutes
+by default. Set
 `permissionPromptTimeoutSeconds` to a positive number to use a different timeout,
 or set it to `0` to wait indefinitely. A timeout never grants permission.
 
@@ -238,8 +272,10 @@ consistently.
 | Path not in `allowWrite` | Prompted (write/edit tools) |
 | Path in `denyWrite` | Hard-blocked, no prompt |
 | Path in `credentials.files` (includes Pi's `auth.json` and `mcp-oauth/`) | Hard-blocked for read/write/edit and the bash pre-check, no prompt; `deny` entries are also unreadable from bash at the OS level |
-| Path referenced by a bash command not in `allowRead` or `allowWrite` | Prompted before the command runs; granting adds to `allowRead` |
+| Path read by a bash command, not in `allowRead` or `allowWrite` | Prompted before the command runs (subject to `bashPathCheck`); granting adds to `allowRead` |
+| Path written by a bash command, not in `allowWrite` | Not prompted; blocked by the OS sandbox |
 | Path in `denyWrite` referenced by a bash command | Hard-blocked before the command runs, no prompt |
+| `/` (filesystem root) | Never grantable from a prompt; read/write/edit and certain bash references are hard-blocked unless configured manually |
 | Domain in `deniedDomains` | Hard-blocked at OS level, no prompt |
 
 Bash filesystem errors do not identify whether a read, write, or execution was
@@ -253,21 +289,93 @@ If a path is added to `allowWrite` via a prompt but is also present in
 `denyWrite`, it remains blocked. A warning is shown explaining which config
 files to check.
 
-Bash commands are also scanned for candidate file paths (best-effort — only
-tokens that already look like a path, e.g. `./`, `../`, `~/`, `${VAR}/`, or an
-absolute path) before they run. A candidate matching `denyWrite` hard-blocks
-the command; a candidate outside `allowRead`/`allowWrite` prompts before the
-command runs, the same allow-list semantics as the read tool — this matters
-because the OS sandbox only deny-lists reads, so paths outside `denyRead`
-would otherwise be silently readable from bash. Expect prompts for system
-paths a command merely mentions (`/usr/bin/...`, `/dev/null`, `/etc/...`);
-grant them once with a broad rule or pre-add them to `allowRead`. `$VAR` and
-`${VAR}` references in candidates are expanded from the environment; tokens
-referencing unset variables are skipped and left to the OS sandbox backstop.
 Filesystem entries without a leading `/` or `~` (e.g. `.env`, `*.pem`) are
 matched using gitignore semantics relative to the working directory, the same
 way they'd behave in a `.gitignore` file. Entries starting with `/` or `~` are
 matched as absolute path prefixes or globs.
+
+### Bash pre-check
+
+The OS sandbox only deny-lists reads, so without a pre-check anything outside
+`denyRead` would be silently readable from bash. Before a bash command runs,
+pi-sandbox parses it (quoting, `;`/`&&`/`||`/pipes, redirections, heredocs,
+here-strings, `$(...)`, backticks, `<(...)`) and collects the paths it will
+touch, each graded by how sure it is that the word is a path:
+
+| Source | Confidence | Examples |
+|--------|------------|----------|
+| File argument of a known tool | high | `cat a`, `sed -i 's/x/y/' cfg`, `grep pat src`, `cp a b`, `tar -xf in.tar -C dir`, `curl -o out URL` |
+| Redirection target | high | `< in`, `> out`, `2>> log` |
+| Interpreter script file | high | `python3 run.py`, `node app.js` |
+| String literal in a file IO call in inline code | high | `open("/etc/x")`, `File.read "x"`, `fs.readFileSync("./a")` |
+| Path-shaped argument of any other command | low | `some-tool /opt/conf ./x ~/y $VAR/z --config=/etc/c` |
+
+**Known tools.** Readers (`cat`, `bat`, `less`, `head`, `tail`, `wc`, `file`,
+`stat`, `od`/`xxd`/`hexdump`, checksum tools, `cut`, `sort`, `diff`, ...),
+search and listing (`grep`/`egrep`/`fgrep`, `rg`, `ag`, `ack`, `find`, `fd`,
+`ls`, `eza`, `tree`, `du`), processors (`sed`, `awk`, `jq`, `yq`), file
+management (`cp`, `mv`, `ln`, `install`, `rm`, `mkdir`, `touch`, `chmod`,
+`chown`, `tee`, `rsync`, `scp`), archives (`tar`, `zip`/`unzip`,
+`gzip`/`bzip2`/`xz`/`zstd`), `dd`, `curl` and `wget`. Each entry knows which
+arguments are not files (`sed`'s script, `grep`'s pattern, `awk`'s program,
+`jq`'s filter, `chmod`'s mode, URLs) and which options take paths
+(`sed -f`, `sort -o`, `tar -f`/`-C`, `curl -T`, ...), and whether each path is
+read or written. In these positions plain names count too: `cat .env` is
+checked the same as `cat ./.env`. Wrappers (`sudo`, `doas`, `env`, `timeout`,
+`nice`, `nohup`, `xargs`, ...) are unwrapped to the command they run, and
+`bash -c`/`sh -c`, shell heredocs, `eval` and `find -exec` are analysed
+recursively. Commands that never open their arguments (`echo`, `printf`,
+`expr`, `test`, `cd`, ...) contribute nothing.
+
+**Inline code.** Python (`python`, `python3`, `pypy`), Ruby and
+JavaScript/TypeScript (`node`, `bun`, `deno`, `tsx`, `ts-node`) code given
+by heredoc, here-string, `-c`, `-e` or `--eval` is scanned for file IO calls:
+Python `open`, `pathlib.Path`, common `os`/`os.path`/`shutil`/`glob`
+functions and pandas/numpy loaders and writers; Ruby `File`, `IO`, `Dir`,
+`FileUtils` and `Pathname`; JavaScript `fs`, `fs.promises`, fs-extra,
+`Bun.file`/`Bun.write`, `Deno.*`, and relative `require`/`import`. Only plain
+string-literal arguments count. Comments, operators, regex literals and other
+strings are ignored. A write mode (`open(p, "w")`), a writing method
+(`Path(p).write_text(...)`) or a destination argument (`shutil.copy(src, dst)`)
+marks the path as a write. When the interpreter runs a script file, its stdin
+is data and is not scanned.
+
+**Heredocs fed to anything else are data.** `cat > script.py <<'EOF' ... EOF`
+only checks `script.py`.
+
+Each path is then decided in order:
+
+1. Standard devices (`/dev/null`, `/dev/stdout`, `/dev/fd/N`, ...) are allowed.
+2. A `credentials.files` entry with `mode: "deny"`, or a `denyWrite` match,
+   hard-blocks the command (whether the path is read or written).
+3. Other writes are left to the OS sandbox, which enforces `allowWrite` as an
+   allow-list. Bash never prompts for write access.
+4. Reads inside `allowRead`/`allowWrite` are allowed.
+5. `/` is hard-blocked when the reference is high confidence (or in `strict`
+   mode) and ignored otherwise, so `a / b` in a command doesn't trigger it.
+6. Remaining high-confidence reads prompt. Low-confidence reads prompt in
+   `strict` mode, or in `tools` mode only if the path exists on disk.
+
+The prompt shows the resolved absolute path, and granting adds the rule to
+`allowRead`. `$VAR` and `${VAR}` are expanded from the environment, and a glob
+contributes its static directory (`cat /etc/*.conf` checks `/etc`).
+
+**Not detected.** These cases fall through to the OS sandbox, which only
+blocks reads under `denyRead`:
+
+- words whose value is only known at runtime: unset variables, `$(...)`,
+  `${VAR:-x}`, and paths built in code (variables, f-strings, `${}`
+  templates, concatenation);
+- relative paths after a `cd`: the working directory is not tracked, so
+  `cd /etc && cat passwd` checks `./passwd`;
+- inline code in other languages (Perl, PHP, ...);
+- arguments of tools outside the table that aren't path-shaped, or that
+  don't exist on disk in `tools` mode.
+
+The parser sits behind the `ShellParser` interface in `src/shell-ast.ts`.
+`src/shell-parse.ts` is the in-house implementation, and an adapter over a
+full bash parser can replace it without changing the extraction or policy
+code.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it
@@ -278,6 +386,16 @@ implies read access; paths do not need to be repeated in `allowRead`.
 `allowUnauthenticatedSocksProxy` is enabled by default on macOS so Git-over-SSH
 works with the built-in `nc`. Domain filtering still applies, but another local process
 that discovers the temporary proxy port can use it while the sandbox is running.
+
+On macOS, set `"allowProcessSignals": true` in your **global** `sandbox.json`
+(by default `~/.pi/agent/sandbox.json`) to let commands signal processes outside
+their own sandbox, such as stopping a dev server started by an earlier command.
+It is disabled by default and ignored in project-local configuration.
+**Security warning:** this also permits signaling unrelated processes the user
+has permission to signal, including terminating or suspending other applications
+and agents. It is not limited to processes started by Pi. Linux and Windows
+behavior is unchanged. Restart Pi after changing this setting; newly wrapped
+commands get the permission, while existing processes keep their original policy.
 
 `network.disabled` turns off network sandboxing entirely: no `--unshare-net` and
 no proxy, so the sandboxed process gets direct network access via the host's

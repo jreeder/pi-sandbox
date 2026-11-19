@@ -12,32 +12,34 @@ import {
   warnIfLinuxUnenforcedGlobs,
 } from "../src/ui.ts";
 
-test("warnIfLinuxUnenforcedGlobs warns only for user-supplied write globs on Linux", () => {
-  const warnings: string[] = [];
-  const ctx = { ui: { notify: (m: string, l: string) => l === "warning" && warnings.push(m) } };
-  const cfg = (fs: object) =>
-    ({
-      ...DEFAULT_CONFIG,
-      filesystem: { ...DEFAULT_CONFIG.filesystem, ...fs },
-    }) as typeof DEFAULT_CONFIG;
+for (const platform of ["linux", "android"] as const) {
+  test(`warnIfLinuxUnenforcedGlobs warns only for user-supplied write globs on ${platform}`, () => {
+    const warnings: string[] = [];
+    const ctx = { ui: { notify: (m: string, l: string) => l === "warning" && warnings.push(m) } };
+    const cfg = (fs: object) =>
+      ({
+        ...DEFAULT_CONFIG,
+        filesystem: { ...DEFAULT_CONFIG.filesystem, ...fs },
+      }) as typeof DEFAULT_CONFIG;
 
-  // stock defaults: silent
-  warnIfLinuxUnenforcedGlobs(ctx as never, DEFAULT_CONFIG, "linux");
-  assert.equal(warnings.length, 0);
+    // stock defaults: silent
+    warnIfLinuxUnenforcedGlobs(ctx as never, DEFAULT_CONFIG, platform);
+    assert.equal(warnings.length, 0);
 
-  // user glob on Linux: one warning naming the key/value
-  warnIfLinuxUnenforcedGlobs(ctx as never, cfg({ denyWrite: ["*.secret"] }), "linux");
-  assert.equal(warnings.length, 1);
-  assert.match(warnings[0], /filesystem\.denyWrite: \*\.secret/);
+    // user glob on Linux: one warning naming the key/value
+    warnIfLinuxUnenforcedGlobs(ctx as never, cfg({ denyWrite: ["*.secret"] }), platform);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /filesystem\.denyWrite: \*\.secret/);
 
-  // same config on macOS: silent
-  warnIfLinuxUnenforcedGlobs(ctx as never, cfg({ denyWrite: ["*.secret"] }), "darwin");
-  assert.equal(warnings.length, 1);
+    // same config on macOS: silent
+    warnIfLinuxUnenforcedGlobs(ctx as never, cfg({ denyWrite: ["*.secret"] }), "darwin");
+    assert.equal(warnings.length, 1);
 
-  // literal-only user entry: silent
-  warnIfLinuxUnenforcedGlobs(ctx as never, cfg({ allowWrite: ["/srv/app"] }), "linux");
-  assert.equal(warnings.length, 1);
-});
+    // literal-only user entry: silent
+    warnIfLinuxUnenforcedGlobs(ctx as never, cfg({ allowWrite: ["/srv/app"] }), platform);
+    assert.equal(warnings.length, 1);
+  });
+}
 
 test("permissionPromptTimeoutMs defaults omission and enables only positive finite timeouts", () => {
   assert.equal(permissionPromptTimeoutMs(undefined), 600_000);
@@ -76,14 +78,13 @@ test(
   { timeout: 1_000 },
   async () => {
     type TestComponent = { render(width: number): string[]; dispose?(): void };
-    type PromptFactory<T> = (
-      tui: { requestRender(): void },
+    type PromptFactory = (
+      tui: { requestRender(): void; getFocusedComponent(): null },
       theme: { fg(color: string, text: string): string },
-      keybindings: object,
-      done: (result: T) => void,
     ) => TestComponent;
 
     let renderedLines: string[] = [];
+    let component: TestComponent | undefined;
     const pi = {
       events: { emit: () => undefined },
     } as unknown as ExtensionAPI;
@@ -91,32 +92,23 @@ test(
       cwd: "/workspace",
       hasUI: true,
       ui: {
-        custom: <T>(factory: PromptFactory<T>): Promise<T> =>
-          new Promise<T>((resolve) => {
-            let component: TestComponent | undefined;
-            const done = (result: T): void => {
-              component?.dispose?.();
-              resolve(result);
-            };
-            component = factory(
-              { requestRender: () => undefined },
-              { fg: (_color, text) => text },
-              {},
-              done,
-            );
-            renderedLines = component.render(80);
-          }),
+        onTerminalInput: () => () => {},
+        setWidget: (_key: string, factory?: PromptFactory): void => {
+          if (!factory) {
+            component?.dispose?.();
+            component = undefined;
+            return;
+          }
+          component = factory(
+            { requestRender: () => undefined, getFocusedComponent: () => null },
+            { fg: (_color, text) => text },
+          );
+          renderedLines = component.render(80);
+        },
       },
     } as unknown as ExtensionContext;
 
-    const result = await showPermissionPrompt(
-      pi,
-      ctx,
-      "Blocked",
-      "example.test",
-      () => null,
-      0.001,
-    );
+    const result = await showPermissionPrompt(pi, ctx, "Blocked", "example.test", () => null, 0.1);
 
     assert.ok(renderedLines.includes("⏳ Auto-abort in 1s (permission stays blocked)"));
     assert.deepEqual(result, { action: "abort", value: "example.test" });

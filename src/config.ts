@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { type SandboxRuntimeConfig } from "@carderne/sandbox-runtime";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
-import { expandPatternList } from "./policy.ts";
+import { BASH_PATH_CHECK_LEVELS, type BashPathCheck, expandPatternList } from "./policy.ts";
 
 export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem"> & {
   /**
@@ -20,7 +20,13 @@ export type SandboxConfig = Omit<SandboxRuntimeConfig, "network" | "filesystem">
   };
   enabled?: boolean;
   sandboxUserShell?: boolean;
+  enableAccessRequestTool?: boolean;
   permissionPromptTimeoutSeconds?: number;
+  /**
+   * How bash commands are checked against the filesystem policy before they
+   * run: "strict", "tools" (default) or "off". See {@link BashPathCheck}.
+   */
+  bashPathCheck?: BashPathCheck;
   network?: NonNullable<SandboxRuntimeConfig["network"]> & {
     allowUnauthenticatedSocksProxy?: boolean;
     /** Route ordinary `ssh` commands through the sandbox SOCKS proxy. */
@@ -55,7 +61,9 @@ export const DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS = 10 * 60;
 export const DEFAULT_CONFIG: SandboxConfig = {
   enabled: true,
   sandboxUserShell: true,
+  enableAccessRequestTool: false,
   permissionPromptTimeoutSeconds: DEFAULT_PERMISSION_PROMPT_TIMEOUT_SECONDS,
+  bashPathCheck: "tools",
   network: {
     allowUnauthenticatedSocksProxy: process.platform === "darwin",
     sshProxy: true,
@@ -119,6 +127,8 @@ export function mergeConfigLayers(
 
   return {
     ...merged,
+    // Cross-sandbox signals can affect unrelated host processes; only global config may grant them.
+    allowProcessSignals: globalConfig.allowProcessSignals === true,
     network: {
       ...merged.network,
       allowedDomains:
@@ -288,6 +298,13 @@ export function loadConfig(cwd: string, projectTrusted = true): SandboxConfig {
     if (filesystem.denyWrite) filesystem.denyWrite = expandPatternList(filesystem.denyWrite);
   }
   merged.credentials = withPiCredentials(merged.credentials);
+  if (!BASH_PATH_CHECK_LEVELS.includes(merged.bashPathCheck as BashPathCheck)) {
+    console.error(
+      `Warning: invalid bashPathCheck ${JSON.stringify(merged.bashPathCheck)}; ` +
+        `expected one of ${BASH_PATH_CHECK_LEVELS.join(", ")}. Using "tools".`,
+    );
+    merged.bashPathCheck = "tools";
+  }
   return merged;
 }
 
