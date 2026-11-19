@@ -32,37 +32,14 @@ pi install git:github.com/jreeder/pi-sandbox
 - **Bash commands are checked against the filesystem policy before they run.**
   Upstream relies on the OS sandbox for bash, and the OS sandbox only
   deny-lists reads: anything outside `denyRead` is silently readable from bash.
-  This fork parses each bash command (quoting, pipelines, redirections,
-  heredocs, `$(...)`) and grades the paths it finds:
-  - **High confidence:** file arguments of known tools (`cat`, `bat`, `head`,
-    `grep`/`rg`, `sed`, `awk`, `jq`, `find`, `ls`, `cp`, `mv`, `tar`, `curl -o`,
-    ... — patterns and scripts such as `sed`'s first argument are skipped),
-    redirection targets, interpreter script files, and string literals passed
-    to file IO calls (`open(...)`, `File.read`, `fs.readFileSync`, ...) in
-    Python, Ruby and JavaScript code given via heredoc, here-string, `-c` or
-    `-e`. `bash -c`, shell heredocs, `eval` and `find -exec` are followed.
-  - **Low confidence:** path-shaped words (`/x`, `./x`, `~/x`, `$VAR/x`) passed
-    to commands not in the tool table.
-
-  Heredocs fed to anything other than an interpreter or shell
-  (`cat > script.py <<EOF`) are treated as data and not scanned, so operators,
-  comments and regex literals in code no longer look like paths.
-
-  Then, controlled by `bashPathCheck`:
-  - a path in `credentials.files` (deny mode) or `denyWrite` hard-blocks;
-  - a write target is otherwise left to the OS sandbox, which enforces
-    `allowWrite` as an allow-list;
-  - a read outside `allowRead`/`allowWrite` prompts if it is high confidence,
-    or (in the default `tools` mode) if it is low confidence and exists on
-    disk. Granting adds the rule to `allowRead`.
-
-  `$VAR`/`${VAR}` are expanded from the environment; words that reference an
-  unset variable or a command substitution are skipped and left to the OS
-  sandbox, as are paths built at runtime inside interpreter code (variables,
-  f-strings, `${}` templates) and the arguments of commands like `echo`,
-  `printf`, `expr` and `test`. A glob contributes its static directory
-  (`cat /etc/*.conf` checks `/etc`). Standard devices (`/dev/null`, ...) never
-  prompt.
+  This fork parses each bash command, works out which paths it will read or
+  write, and checks them before the command runs: reads outside
+  `allowRead`/`allowWrite` prompt, and `denyWrite` and credential files
+  hard-block. It knows the file arguments of common CLI tools, redirections,
+  and file IO calls in inline Python, Ruby and JavaScript (heredocs, `-c`,
+  `-e`), and treats code written to a file through a heredoc as data, so
+  operators, comments and regex literals in code don't look like paths.
+  Strictness is set with `bashPathCheck`. See [Bash pre-check](#bash-pre-check).
 - **The filesystem root can never be granted while the sandbox is enabled.**
   Permission prompts, `/sandbox-allow` and `sandbox_request_access` reject
   rules that cover `/` (`/`, `//`, `/*`, `/**`). A bash command that certainly
@@ -218,7 +195,7 @@ Note below that the order of precedence for filesystem read and write are opposi
 |-------|-----------|
 | `strict` | Every read outside `allowRead`/`allowWrite` prompts, including low-confidence words that don't exist; a low-confidence `/` blocks |
 | `tools` (default) | High-confidence reads prompt; low-confidence words prompt only if they exist on disk; a low-confidence `/` is ignored |
-| `off` | No pre-check; the OS sandbox alone enforces the policy (credential `deny` files are still unreadable at the OS level) |
+| `off` | No pre-check, including the bash `denyWrite` and credential-file checks; the OS sandbox alone enforces the policy (credential `deny` files stay unreadable and `denyWrite` paths unwritable at the OS level, except glob entries on Linux) |
 
 Filesystem patterns may reference environment variables with `${VAR}` syntax
 (e.g. `"${HOME}/secrets"`) and a leading `~` is expanded to the home
@@ -312,21 +289,93 @@ If a path is added to `allowWrite` via a prompt but is also present in
 `denyWrite`, it remains blocked. A warning is shown explaining which config
 files to check.
 
-Bash commands are also scanned for candidate file paths (best-effort — only
-tokens that already look like a path, e.g. `./`, `../`, `~/`, `${VAR}/`, or an
-absolute path) before they run. A candidate matching `denyWrite` hard-blocks
-the command; a candidate outside `allowRead`/`allowWrite` prompts before the
-command runs, the same allow-list semantics as the read tool — this matters
-because the OS sandbox only deny-lists reads, so paths outside `denyRead`
-would otherwise be silently readable from bash. Expect prompts for system
-paths a command merely mentions (`/usr/bin/...`, `/dev/null`, `/etc/...`);
-grant them once with a broad rule or pre-add them to `allowRead`. `$VAR` and
-`${VAR}` references in candidates are expanded from the environment; tokens
-referencing unset variables are skipped and left to the OS sandbox backstop.
 Filesystem entries without a leading `/` or `~` (e.g. `.env`, `*.pem`) are
 matched using gitignore semantics relative to the working directory, the same
 way they'd behave in a `.gitignore` file. Entries starting with `/` or `~` are
 matched as absolute path prefixes or globs.
+
+### Bash pre-check
+
+The OS sandbox only deny-lists reads, so without a pre-check anything outside
+`denyRead` would be silently readable from bash. Before a bash command runs,
+pi-sandbox parses it (quoting, `;`/`&&`/`||`/pipes, redirections, heredocs,
+here-strings, `$(...)`, backticks, `<(...)`) and collects the paths it will
+touch, each graded by how sure it is that the word is a path:
+
+| Source | Confidence | Examples |
+|--------|------------|----------|
+| File argument of a known tool | high | `cat a`, `sed -i 's/x/y/' cfg`, `grep pat src`, `cp a b`, `tar -xf in.tar -C dir`, `curl -o out URL` |
+| Redirection target | high | `< in`, `> out`, `2>> log` |
+| Interpreter script file | high | `python3 run.py`, `node app.js` |
+| String literal in a file IO call in inline code | high | `open("/etc/x")`, `File.read "x"`, `fs.readFileSync("./a")` |
+| Path-shaped argument of any other command | low | `some-tool /opt/conf ./x ~/y $VAR/z --config=/etc/c` |
+
+**Known tools.** Readers (`cat`, `bat`, `less`, `head`, `tail`, `wc`, `file`,
+`stat`, `od`/`xxd`/`hexdump`, checksum tools, `cut`, `sort`, `diff`, ...),
+search and listing (`grep`/`egrep`/`fgrep`, `rg`, `ag`, `ack`, `find`, `fd`,
+`ls`, `eza`, `tree`, `du`), processors (`sed`, `awk`, `jq`, `yq`), file
+management (`cp`, `mv`, `ln`, `install`, `rm`, `mkdir`, `touch`, `chmod`,
+`chown`, `tee`, `rsync`, `scp`), archives (`tar`, `zip`/`unzip`,
+`gzip`/`bzip2`/`xz`/`zstd`), `dd`, `curl` and `wget`. Each entry knows which
+arguments are not files (`sed`'s script, `grep`'s pattern, `awk`'s program,
+`jq`'s filter, `chmod`'s mode, URLs) and which options take paths
+(`sed -f`, `sort -o`, `tar -f`/`-C`, `curl -T`, ...), and whether each path is
+read or written. In these positions plain names count too: `cat .env` is
+checked the same as `cat ./.env`. Wrappers (`sudo`, `doas`, `env`, `timeout`,
+`nice`, `nohup`, `xargs`, ...) are unwrapped to the command they run, and
+`bash -c`/`sh -c`, shell heredocs, `eval` and `find -exec` are analysed
+recursively. Commands that never open their arguments (`echo`, `printf`,
+`expr`, `test`, `cd`, ...) contribute nothing.
+
+**Inline code.** Python (`python`, `python3`, `pypy`), Ruby and
+JavaScript/TypeScript (`node`, `bun`, `deno`, `tsx`, `ts-node`) code given
+by heredoc, here-string, `-c`, `-e` or `--eval` is scanned for file IO calls:
+Python `open`, `pathlib.Path`, common `os`/`os.path`/`shutil`/`glob`
+functions and pandas/numpy loaders and writers; Ruby `File`, `IO`, `Dir`,
+`FileUtils` and `Pathname`; JavaScript `fs`, `fs.promises`, fs-extra,
+`Bun.file`/`Bun.write`, `Deno.*`, and relative `require`/`import`. Only plain
+string-literal arguments count. Comments, operators, regex literals and other
+strings are ignored. A write mode (`open(p, "w")`), a writing method
+(`Path(p).write_text(...)`) or a destination argument (`shutil.copy(src, dst)`)
+marks the path as a write. When the interpreter runs a script file, its stdin
+is data and is not scanned.
+
+**Heredocs fed to anything else are data.** `cat > script.py <<'EOF' ... EOF`
+only checks `script.py`.
+
+Each path is then decided in order:
+
+1. Standard devices (`/dev/null`, `/dev/stdout`, `/dev/fd/N`, ...) are allowed.
+2. A `credentials.files` entry with `mode: "deny"`, or a `denyWrite` match,
+   hard-blocks the command (whether the path is read or written).
+3. Other writes are left to the OS sandbox, which enforces `allowWrite` as an
+   allow-list. Bash never prompts for write access.
+4. Reads inside `allowRead`/`allowWrite` are allowed.
+5. `/` is hard-blocked when the reference is high confidence (or in `strict`
+   mode) and ignored otherwise, so `a / b` in a command doesn't trigger it.
+6. Remaining high-confidence reads prompt. Low-confidence reads prompt in
+   `strict` mode, or in `tools` mode only if the path exists on disk.
+
+The prompt shows the resolved absolute path, and granting adds the rule to
+`allowRead`. `$VAR` and `${VAR}` are expanded from the environment, and a glob
+contributes its static directory (`cat /etc/*.conf` checks `/etc`).
+
+**Not detected.** These cases fall through to the OS sandbox, which only
+blocks reads under `denyRead`:
+
+- words whose value is only known at runtime: unset variables, `$(...)`,
+  `${VAR:-x}`, and paths built in code (variables, f-strings, `${}`
+  templates, concatenation);
+- relative paths after a `cd`: the working directory is not tracked, so
+  `cd /etc && cat passwd` checks `./passwd`;
+- inline code in other languages (Perl, PHP, ...);
+- arguments of tools outside the table that aren't path-shaped, or that
+  don't exist on disk in `tools` mode.
+
+The parser sits behind the `ShellParser` interface in `src/shell-ast.ts`.
+`src/shell-parse.ts` is the in-house implementation, and an adapter over a
+full bash parser can replace it without changing the extraction or policy
+code.
 
 `allowedDomains` supports `*.example.com` wildcards. It also supports `"*"` to
 allow all domains; pi-sandbox shows a warning when this is configured because it
